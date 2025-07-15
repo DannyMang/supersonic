@@ -1,0 +1,3 @@
+- Deep Learning Library for ultra-fast finetuning
+- Quantize models
+- be able to run the largest models while being GPU Poor. 
