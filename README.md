@@ -257,38 +257,31 @@ class TinyTensor:
 
 ### Core Library Structure
 
-```
-ultralm/
-├── core/
-│   ├── tensor.py          # Lazy tensor implementation
-│   ├── ops.py             # Core operations (~25 ops)
-│   ├── device.py          # Hardware abstraction
-│   └── fusion.py          # Kernel fusion engine
+supersonic/
+├── __init__.py           # Main API entry point
 ├── quantization/
-│   ├── awq.py             # AWQ implementation
-│   ├── aqlm.py            # AQLM 2-bit compression
-│   ├── qlora.py           # QLoRA integration
-│   └── fp8.py             # FP8 quantization
-├── finetuning/
-│   ├── lora.py            # LoRA implementation
-│   ├── dora.py            # DoRA implementation
-│   ├── optimizers.py      # 8-bit optimizers
-│   └── memory.py          # Memory management
+│   ├── awq.py           # AWQ quantization
+│   ├── qlora.py         # QLoRA integration
+│   └── dynamic.py       # Dynamic quantization (UnSloth-style)
 ├── kernels/
-│   ├── attention.py       # FlashAttention variants
-│   ├── cuda/              # CUDA kernel implementations
-│   ├── metal/             # Metal shader implementations
-│   └── triton/            # Triton kernel implementations
+│   ├── triton/          # Custom Triton kernels only
+│   │   ├── rope.py      # RoPE embedding
+│   │   ├── cross_entropy.py  # Memory-efficient loss
+│   │   ├── rms_norm.py  # Fused RMSNorm
+│   │   └── qlora.py     # Fused QLoRA operations
+│   └── __init__.py      # Kernel registry
+├── training/
+│   ├── trainer.py       # Main training loop
+│   ├── lora.py          # LoRA/DoRA adapters
+│   └── memory.py        # Memory optimization
 ├── models/
-│   ├── llama.py           # LLaMA model implementations
-│   ├── mistral.py         # Mistral model implementations
-│   └── transformers.py   # Generic transformer blocks
-└── integration/
-    ├── huggingface.py     # HF transformers integration
-    ├── pytorch.py         # PyTorch compatibility
-    └── gguf.py            # GGUF format support
-```
-
+│   ├── llama.py         # LLaMA patches for TinyGrad
+│   ├── mistral.py       # Mistral patches
+│   └── base.py          # Base model wrapper
+└── export/
+    ├── vllm.py          # vLLM export
+    ├── gguf.py          # GGUF conversion
+    └── hf.py            # HuggingFace compatibility
 ### Development Priority Matrix
 
 **High Priority (Months 1-12):**
