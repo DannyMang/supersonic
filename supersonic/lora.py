@@ -168,20 +168,20 @@ class MergedLinear(LoRALayer):
 
         return indices.reshape(-1)
 
-    def zero_pad(self, x:Tensor):
-        result_shape = (len(self.lora_ind), *x.shape[1:])
+    def zero_pad(self, x: Tensor):
+        if not hasattr(self.lora_ind, 'shape'):
+            self.lora_ind = Tensor(self.lora_ind)
+
+        result_shape = (self.lora_ind.shape[0], *x.shape[1:])
         result = Tensor.zeros(*result_shape, dtype=x.dtype, device=x.device)
-        result[self.lora_ind]=x
+        result[self.lora_ind] = x
         return result
 
     def merge_AB(self):
-        def T(w:Tensor):
+        def T(w: Tensor):
             return w.T if self.fan_in_fan_out else w
-
-        #to -do learn + impl tmr
-        # delta_w = F.conv1d(
-        #     self.lora_A.unsqueeze(0),
-        #     self.lora_B.unsqueeze(-1),
-        #     groups=sum(self.enable_lora)
-        # ).squeeze(0)
-        # return T(self.zero_pad(delta_w))
+        delta_w = self.lora_A.unsqueeze(0).conv2d(
+            self.lora_B.unsqueeze(-1),
+            groups=sum(self.enable_lora)
+        ).squeeze(0)
+        return T(self.zero_pad(delta_w))
