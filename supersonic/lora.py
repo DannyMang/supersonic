@@ -1,7 +1,9 @@
-from tinygrad.tensor  import  Tensor
+from tinygrad import dtype
+from tinygrad.device import device
+from tinygrad.tensor  import Tensor
 from tinygrad.engine.jit import TinyJit
 import tinygrad.nn as nn
-from typing import cast
+from typing import cast, Optional, List
 from utils import dropout
 #import torch.nn as nn
 
@@ -98,3 +100,88 @@ class Embedding(LoRALayer):
             return cast(Tensor, base_result + lora_result)
         else:
             return self.weight[x]
+
+class MergedLinear(LoRALayer):
+    #LoRA implemented in a base LoRALayer
+    def __init__(
+        self,
+        in_features:int,
+        out_features:int,
+        r:int=0,
+        lora_alpha:int=1,
+        lora_dropout:float = 0.,
+        enable_lora: List[bool] = [False],
+        fan_in_fan_out: bool = False,
+        merge_weights:bool = True,
+        **kwargs
+    ):
+        LoRALayer.__init__(self, r=r, lora_alpha=lora_alpha, lora_dropout=lora_dropout,
+                        merge_weights=merge_weights)
+        self.linear = nn.Linear(in_features,out_features,bias=True)
+        assert out_features % len(enable_lora) == 0, \
+                   'The length of enable_lora must divide out_features'
+        self.in_features = in_features
+        self.out_features = out_features
+        self.enable_lora = enable_lora
+        self.fan_in_fan_out = fan_in_fan_out
+        self.weight = Tensor.kaiming_uniform(out_features, in_features)
+        self.bias = Tensor.zeros(out_features)
+
+        #Trainable params
+        if r > 0 and any(enable_lora):
+            num_lora_projections = sum(enable_lora)
+            projection_size = out_features // len(enable_lora)
+            #LoRA A: (r * num_lora_projections, in_features)
+            self.lora_A = Tensor.zeros(
+                r * num_lora_projections,
+                in_features,
+                requires_grad=True
+            )
+
+            # LoRA B: (projection_size * num_lora_projections, r)
+            self.lora_B = Tensor.zeros(
+                projection_size * num_lora_projections,
+                r,
+                requires_grad=True
+            )
+            self.scaling = self.lora_alpha / self.r
+            self.weight.requires_grad = False
+            self.lora_ind = self._create_lora_indices()
+
+        self.reset_parameters()
+
+        if fan_in_fan_out:
+            self.weight = self.weight.T
+
+    def reset_parameters(self):
+        if hasattr(self, 'lora_A'):
+            self.lora_A = Tensor.kaiming_uniform(*self.lora_A.shape, requires_grad=True)
+            self.lora_B = Tensor.zeros(*self.lora_B.shape, requires_grad=True)
+
+    def _create_lora_indices(self):
+        #TO-DO review this
+        proj_size = self.out_features // len(self.enable_lora)
+        indices = Tensor.zeros(len(self.enable_lora), proj_size, dtype='bool')
+        for i, enabled in enumerate(self.enable_lora):
+            if enabled:
+                indices[i] = True
+
+        return indices.reshape(-1)
+
+    def zero_pad(self, x:Tensor):
+        result_shape = (len(self.lora_ind), *x.shape[1:])
+        result = Tensor.zeros(*result_shape, dtype=x.dtype, device=x.device)
+        result[self.lora_ind]=x
+        return result
+
+    def merge_AB(self):
+        def T(w:Tensor):
+            return w.T if self.fan_in_fan_out else w
+
+        #to -do learn + impl tmr
+        # delta_w = F.conv1d(
+        #     self.lora_A.unsqueeze(0),
+        #     self.lora_B.unsqueeze(-1),
+        #     groups=sum(self.enable_lora)
+        # ).squeeze(0)
+        # return T(self.zero_pad(delta_w))
