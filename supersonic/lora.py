@@ -35,7 +35,6 @@ class LoRALayer():
     def train(self, mode:bool=True):
         #Setter for setting the training mode attr for dropout
         self.training = mode
-        return self
 
 class Embedding(LoRALayer):
     def __init__(
@@ -88,8 +87,6 @@ class Embedding(LoRALayer):
                     self.weight += (self.lora_B.matmul(self.lora_A)).transpose(0, 1) * self.scaling
                 self.merged = True
 
-        return self
-
     def __call__(self, x:Tensor) -> Tensor:
         #Forward pass
         if self.r > 0 and not self.merged:
@@ -100,6 +97,107 @@ class Embedding(LoRALayer):
             return cast(Tensor, base_result + lora_result)
         else:
             return self.weight[x]
+
+class Linear(LoRALayer):
+    # LoRA implemented in a dense layer
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        r: int = 0,
+        lora_alpha: int = 1,
+        lora_dropout: float = 0.,
+        fan_in_fan_out: bool = False, # Set this to True if the layer to replace stores weight like (fan_in, fan_out)
+        merge_weights: bool = True,
+        **kwargs
+    ):
+        self.linear = nn.Linear(in_features,out_features,bias=True)
+        LoRALayer.__init__(self, r=r, lora_alpha=lora_alpha, lora_dropout=lora_dropout,
+                           merge_weights=merge_weights)
+        self.in_features = in_features
+        self.out_features = out_features
+        self.fan_in_fan_out = fan_in_fan_out
+
+         # Initialize weight and bias
+        bound = 1 / (in_features ** 0.5)
+        self.weight = Tensor.uniform(out_features, in_features, low=-bound, high=bound)
+        self.bias = Tensor.uniform(out_features, low=-bound, high=bound)
+
+        #Trainable params
+        if r > 0:
+            # For basic Linear: only 1 projection, so:
+            # num_lora_projections = 1 (instead of sum(enable_lora))
+            # projection_size = out_features (instead of out_features // len(enable_lora))
+
+            # LoRA A: (r, in_features)
+            self.lora_A = Tensor.zeros(
+                r,                    # Just r, not r * num_projections
+                in_features,
+                requires_grad=True
+            )
+
+            # LoRA B: (out_features, r)
+            self.lora_B = Tensor.zeros(
+                out_features,         # Just out_features
+                r,
+                requires_grad=True
+            )
+
+            self.scaling = self.lora_alpha / self.r
+            self.weight.requires_grad = False
+        self.reset_parameters()
+
+        if fan_in_fan_out:
+            self.weight = self.weight.T
+
+    def reset_parameters(self):
+        if hasattr(self, 'lora_A'):
+            self.lora_A = Tensor.kaiming_uniform(*self.lora_A.shape, requires_grad=True)
+            self.lora_B = Tensor.zeros(*self.lora_B.shape, requires_grad=True)
+
+
+    def train(self, mode:bool=True):
+        def T(w: Tensor):
+            return w.T if self.fan_in_fan_out else w
+        if mode:
+            if self.merge_weights and self.merged:
+                if self.r > 0:
+                    #to ensure weights are not MergedLinear
+                    self.weight -= (self.lora_B.matmul(self.lora_A)).T * self.scaling
+                self.merged = False
+        else:
+            if self.merge_weights and not self.merged:
+                # Merge the weights and mark it
+                if self.r > 0:
+                    self.weight += (self.lora_B.matmul(self.lora_A)).T * self.scaling
+                self.merged = True
+
+    def forward(self, x: Tensor) -> Tensor:
+            def T(w: Tensor) -> Tensor:
+                return cast(Tensor, w.transpose(0, 1) if self.fan_in_fan_out else w)
+
+            # Cast self.weight and self.bias to Tensor to help type checker
+            weight = cast(Tensor, self.weight)
+            bias = cast(Tensor, self.bias)
+
+            if self.r > 0 and not self.merged:
+                # Base linear transformation
+                result = x.linear(cast(Tensor, T(weight).transpose()), bias=bias)
+
+                # LoRA path: x -> A^T -> B^T, using dot() to avoid type issues
+                lora_x = cast(Tensor, self.lora_dropout(x))
+                lora_A = cast(Tensor, self.lora_A)
+                lora_B = cast(Tensor, self.lora_B)
+
+                # Chain the multiplications: x @ A^T @ B^T
+                after_A = cast(Tensor, lora_x.dot(lora_A.T))
+                lora_result = cast(Tensor, after_A.dot(lora_B.T) * self.scaling)
+
+                return cast(Tensor, result + lora_result)
+            else:
+                return x.linear(cast(Tensor, T(weight).transpose()), bias=bias)
+
+
 
 class MergedLinear(LoRALayer):
     #LoRA implemented in a base LoRALayer
@@ -185,3 +283,33 @@ class MergedLinear(LoRALayer):
             groups=sum(self.enable_lora)
         ).squeeze(0)
         return T(self.zero_pad(delta_w))
+
+    def train(self, mode:bool=True):
+        def T(w: Tensor):
+            return w.T if self.fan_in_fan_out else w
+        if mode:
+            if self.merge_weights and self.merged:
+                if self.r > 0 and any(self.enable_lora):
+                    #to ensure weights are not MergedLinear
+                    self.weight -= self.merge_AB() * self.scaling
+                self.merged = False
+        else:
+            if self.merge_weights and not self.merged:
+                # Merge the weights and mark it
+                if self.r > 0 and any(self.enable_lora):
+                    self.weight += self.merge_AB() * self.scaling
+                self.merged = True
+
+    def forward(self, x: Tensor) -> Tensor:
+        def T(w: Tensor) -> Tensor:
+            return w.transpose(0, 1) if self.fan_in_fan_out else w
+
+        if self.merged:
+            return x.linear(T(self.weight).transpose(), self.bias)
+        else:
+            result = x.linear(T(self.weight).transpose(), self.bias)
+            if self.r > 0:
+                lora_input = cast(Tensor, self.lora_dropout(x))
+                lora_result = lora_input.matmul(T(self.merge_AB().T)) * self.scaling
+                result += lora_result
+            return result
