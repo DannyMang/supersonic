@@ -11,33 +11,7 @@ ROADMAP:
 
 The current landscape of LLM optimization is rapidly evolving, with breakthrough advances in quantization (sub-4-bit compression), memory-efficient finetuning (QLoRA, DoRA), and kernel optimization (FlashAttention-3, Triton). **Building a competitive library requires focusing on memory bandwidth optimization, hardware-aware kernel design, and seamless ecosystem integration**. The recommended approach combines TinyGrad's minimalist architecture with UnSloth.ai's practical optimizations, targeting a 2-3x performance improvement over existing solutions.
 
-## Part 1: Comprehensive Development Roadmap
-
-### Phase 1: Foundation Architecture (Months 1-4)
-
-**Core Design Philosophy**
-- **Minimalist RISC-like approach**: Following TinyGrad's philosophy of ~25 core operations
-- **Lazy execution with aggressive fusion**: Enable optimization across operation boundaries
-- **Memory-first design**: Prioritize memory bandwidth optimization over compute optimization
-- **Hardware abstraction layer**: Support CUDA, Metal, and future accelerators from day one
-
-**Technical Implementation**
-```python
-# Core operation set (inspired by TinyGrad)
-CORE_OPS = [
-    'ADD', 'MUL', 'MAX', 'RESHAPE', 'PERMUTE', 'EXPAND', 'CONTRACTDIM',
-    'UNPAD', 'PAD', 'SHRINK', 'STRIDE', 'BUFFER', 'LOAD', 'STORE'
-]
-```
-
-**Key Deliverables:**
-- Tensor abstraction with lazy evaluation
-- Hardware backend abstraction (CUDA, Metal, CPU)
-- Operation fusion engine
-- Memory management system
-- Basic mathematical operations
-
-### Phase 2: Quantization Engine (Months 5-8)
+### Quantization Engine
 
 **Advanced Quantization Stack**
 - **4-bit quantization**: AWQ implementation (superior to GPTQ)
@@ -63,7 +37,7 @@ class QuantizationEngine:
 - 2-bit quantization: 85%+ accuracy retention
 - 3-4x memory reduction with 2-3x inference speedup
 
-### Phase 3: Memory-Efficient Finetuning (Months 9-12)
+### Memory-Efficient Finetuning
 
 **PEFT Integration Stack**
 - **LoRA/QLoRA**: Standard implementation with 4-bit quantization
@@ -87,7 +61,7 @@ class MemoryOptimizedTrainer:
 - 2x RTX 4090: 70B models with CPU offloading
 - 4x RTX 4090: 405B models with advanced techniques
 
-### Phase 4: Kernel Optimization (Months 13-16)
+###  Kernel Optimization
 
 **High-Performance Kernel Stack**
 - **FlashAttention-3**: Latest attention optimization (20-40% faster)
@@ -112,7 +86,7 @@ class OptimizedAttention:
 - Linear memory scaling with sequence length
 - 90%+ GPU utilization on target hardware
 
-### Phase 5: Production Integration (Months 17-20)
+### Production Integration
 
 **Ecosystem Compatibility**
 - **HuggingFace integration**: Seamless model loading and saving
@@ -202,20 +176,6 @@ class OptimizedAttention:
 - **Hardware abstraction**: Easy backend integration
 - **Kernel fusion**: Automatic operation combining
 
-**Implementation Pattern:**
-```python
-class TinyTensor:
-    def __init__(self, data, requires_grad=True):
-        self.data = data
-        self.grad = None
-        self.requires_grad = requires_grad
-        self._ctx = None
-
-    def backward(self):
-        if self.requires_grad:
-            self.grad = 1.0 if self.grad is None else self.grad
-            # Propagate gradients through computation graph
-```
 
 ### UnSloth.ai Optimization Strategies
 
