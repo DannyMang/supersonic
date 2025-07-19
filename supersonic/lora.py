@@ -113,7 +113,6 @@ class Linear(LoRALayer):
         merge_weights: bool = True,
         **kwargs
     ):
-        self.linear = nn.Linear(in_features,out_features,bias=True)
         LoRALayer.__init__(self, r=r, lora_alpha=lora_alpha, lora_dropout=lora_dropout,
                            merge_weights=merge_weights)
         self.in_features = in_features
@@ -163,43 +162,43 @@ class Linear(LoRALayer):
             return w.T if self.fan_in_fan_out else w
 
         super().train(mode)
+
         if mode:
             if self.merge_weights and self.merged:
                 if self.r > 0:
                     #to ensure weights are not MergedLinear
-                    self.weight -= (self.lora_B.matmul(self.lora_A)).T * self.scaling
+                    self.weight -= T(self.lora_B @ self.lora_A) * self.scaling
                 self.merged = False
         else:
             if self.merge_weights and not self.merged:
                 # Merge the weights and mark it
                 if self.r > 0:
-                    self.weight += (self.lora_B.matmul(self.lora_A)).T * self.scaling
+                    self.weight += T(self.lora_B @ self.lora_A) * self.scaling
                 self.merged = True
 
     def __call__(self, x: Tensor) -> Tensor:
-            def T(w: Tensor) -> Tensor:
-                return cast(Tensor, w.transpose(0, 1) if self.fan_in_fan_out else w)
+        def T(w):
+            return w.T if self.fan_in_fan_out else w
 
-            # Cast self.weight and self.bias to Tensor to help type checker
-            weight = cast(Tensor, self.weight)
-            bias = cast(Tensor, self.bias)
+        if self.r > 0 and not self.merged:
+            result = x @ T(self.weight).T
+            if self.bias is not None:
+                result = result + self.bias
 
-            if self.r > 0 and not self.merged:
-                # Base linear transformation
-                result = x.linear(cast(Tensor, T(weight).transpose()), bias=bias)
+            lora_result = (
+                self.lora_dropout(x) @
+                self.lora_A.T @
+                self.lora_B.T
+            ) * self.scaling
 
-                # LoRA path: x -> A^T -> B^T, using dot() to avoid type issues
-                lora_x = cast(Tensor, self.lora_dropout(x))
-                lora_A = cast(Tensor, self.lora_A)
-                lora_B = cast(Tensor, self.lora_B)
+            final_result = result + lora_result
+            return cast(Tensor, final_result)
+        else:
+            result = x @ T(self.weight).T
+            if self.bias is not None:
+                result = result + self.bias
+            return cast(Tensor, result)
 
-                # Chain the multiplications: x @ A^T @ B^T
-                after_A = cast(Tensor, lora_x.dot(lora_A.T))
-                lora_result = cast(Tensor, after_A.dot(lora_B.T) * self.scaling)
-
-                return cast(Tensor, result + lora_result)
-            else:
-                return x.linear(cast(Tensor, T(weight).transpose()), bias=bias)
 
 
 
@@ -219,7 +218,6 @@ class MergedLinear(LoRALayer):
     ):
         LoRALayer.__init__(self, r=r, lora_alpha=lora_alpha, lora_dropout=lora_dropout,
                         merge_weights=merge_weights)
-        self.linear = nn.Linear(in_features,out_features,bias=True)
         assert out_features % len(enable_lora) == 0, \
                    'The length of enable_lora must divide out_features'
         self.in_features = in_features
@@ -291,11 +289,14 @@ class MergedLinear(LoRALayer):
     def train(self, mode:bool=True):
         def T(w: Tensor):
             return w.T if self.fan_in_fan_out else w
+
+        super().train(mode)
+
         if mode:
             if self.merge_weights and self.merged:
                 if self.r > 0 and any(self.enable_lora):
                     #to ensure weights are not MergedLinear
-                    self.weight -= self.merge_AB() * self.scaling
+                    self.weight-= self.merge_AB() * self.scaling
                 self.merged = False
         else:
             if self.merge_weights and not self.merged:
@@ -321,7 +322,6 @@ class MergedLinear(LoRALayer):
 
 class ConvLoRA(LoRALayer):
     def __init__(self, conv_module, in_channels, out_channels, kernel_size, r=0, lora_alpha=1, lora_dropout=0., merge_weights=True, **kwargs):
-        super(ConvLoRA, self).__init__()
         self.conv = conv_module(in_channels,out_channels,kernel_size,**kwargs)
         self.weight = self.conv.weight
         if hasattr(self.conv, 'bias') and self.conv.bias is not None:
@@ -332,11 +332,12 @@ class ConvLoRA(LoRALayer):
 
         #Trainable Parameters
         if r>0:
-            self.lora_A = self.conv.weight.new_zeros((r * kernel_size, in_channels * kernel_size))
-            self.lora_B = self.conv.weight.new_zeros((out_channels//self.conv.groups*kernel_size, r*kernel_size))
+            self.lora_A = Tensor.zeros(r * kernel_size, in_channels * kernel_size, requires_grad=True)
+            self.lora_B = Tensor.zeros(out_channels//self.conv.groups*kernel_size, r*kernel_size, requires_grad=True)
             self.scaling = self.lora_alpha / self.r
-            # Freezing the pre-trained weight matrix
+            #Freeze params
             self.conv.weight.requires_grad = False
+
         self.reset_parameters()
         self.merged = False
 
