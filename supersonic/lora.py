@@ -3,8 +3,10 @@ from tinygrad.device import device
 from tinygrad.tensor  import Tensor
 from tinygrad.engine.jit import TinyJit
 import tinygrad.nn as nn
+import math
 from typing import cast, Optional, List
 from utils import dropout
+
 #import torch.nn as nn
 
 class LoRALayer():
@@ -152,13 +154,15 @@ class Linear(LoRALayer):
 
     def reset_parameters(self):
         if hasattr(self, 'lora_A'):
-            self.lora_A = Tensor.kaiming_uniform(*self.lora_A.shape, requires_grad=True)
+            self.lora_A = Tensor.kaiming_uniform(*self.lora_A.shape, a=math.sqrt(5), requires_grad=True)
             self.lora_B = Tensor.zeros(*self.lora_B.shape, requires_grad=True)
 
 
     def train(self, mode:bool=True):
         def T(w: Tensor):
             return w.T if self.fan_in_fan_out else w
+
+        super().train(mode)
         if mode:
             if self.merge_weights and self.merged:
                 if self.r > 0:
@@ -172,7 +176,7 @@ class Linear(LoRALayer):
                     self.weight += (self.lora_B.matmul(self.lora_A)).T * self.scaling
                 self.merged = True
 
-    def forward(self, x: Tensor) -> Tensor:
+    def __call__(self, x: Tensor) -> Tensor:
             def T(w: Tensor) -> Tensor:
                 return cast(Tensor, w.transpose(0, 1) if self.fan_in_fan_out else w)
 
@@ -253,7 +257,7 @@ class MergedLinear(LoRALayer):
 
     def reset_parameters(self):
         if hasattr(self, 'lora_A'):
-            self.lora_A = Tensor.kaiming_uniform(*self.lora_A.shape, requires_grad=True)
+            self.lora_A = Tensor.kaiming_uniform(*self.lora_A.shape, a=math.sqrt(5), requires_grad=True)
             self.lora_B = Tensor.zeros(*self.lora_B.shape, requires_grad=True)
 
     def _create_lora_indices(self):
@@ -300,7 +304,7 @@ class MergedLinear(LoRALayer):
                     self.weight += self.merge_AB() * self.scaling
                 self.merged = True
 
-    def forward(self, x: Tensor) -> Tensor:
+    def __call__(self, x: Tensor) -> Tensor:
         def T(w: Tensor) -> Tensor:
             return w.transpose(0, 1) if self.fan_in_fan_out else w
 
@@ -313,3 +317,62 @@ class MergedLinear(LoRALayer):
                 lora_result = lora_input.matmul(T(self.merge_AB().T)) * self.scaling
                 result += lora_result
             return result
+
+
+class ConvLoRA(LoRALayer):
+    def __init__(self, conv_module, in_channels, out_channels, kernel_size, r=0, lora_alpha=1, lora_dropout=0., merge_weights=True, **kwargs):
+        super(ConvLoRA, self).__init__()
+        self.conv = conv_module(in_channels,out_channels,kernel_size,**kwargs)
+        self.weight = self.conv.weight
+        if hasattr(self.conv, 'bias') and self.conv.bias is not None:
+            self.bias = self.conv.bias
+
+        LoRALayer.__init__(self, r=r, lora_alpha=lora_alpha, lora_dropout=lora_dropout, merge_weights=merge_weights)
+        assert isinstance(kernel_size, int)
+
+        #Trainable Parameters
+        if r>0:
+            self.lora_A = self.conv.weight.new_zeros((r * kernel_size, in_channels * kernel_size))
+            self.lora_B = self.conv.weight.new_zeros((out_channels//self.conv.groups*kernel_size, r*kernel_size))
+            self.scaling = self.lora_alpha / self.r
+            # Freezing the pre-trained weight matrix
+            self.conv.weight.requires_grad = False
+        self.reset_parameters()
+        self.merged = False
+
+    def reset_parameters(self):
+        if hasattr(self, 'lora_A'):
+            self.lora_A = Tensor.kaiming_uniform(*self.lora_A.shape, a=math.sqrt(5), requires_grad=True)
+            self.lora_B = Tensor.zeros(*self.lora_B.shape, requires_grad=True)
+
+    def train(self,mode=True):
+        super(ConvLoRA,self).train(mode)
+        if mode:
+            if self.merge_weights and self.merged:
+                if self.r > 0:
+                    # Make sure that the weights are not merged
+                    self.conv.weight -= (self.lora_B @ self.lora_A).view(self.conv.weight.shape) * self.scaling
+                self.merged = False
+        else:
+            if self.merge_weights and not self.merged:
+                if self.r > 0:
+                    # Merge the weights and mark it
+                    self.conv.weight += (self.lora_B @ self.lora_A).view(self.conv.weight.shape) * self.scaling
+                self.merged = True
+
+    def __call__(self, x):
+        if self.r > 0 and not self.merged:
+            return self.conv._conv_forward(
+                x,
+                self.conv.weight + (self.lora_B.matmul(self.lora_A)).view(self.conv.weight.shape) * self.scaling,
+                self.conv.bias
+            )
+        return self.conv(x)
+
+class Conv2d(ConvLoRA):
+    def __init__(self, *args, **kwargs):
+        super(Conv2d, self).__init__(nn.Conv2d, *args, **kwargs)
+
+class Conv1d(ConvLoRA):
+    def __init__(self, *args, **kwargs):
+        super(Conv1d, self).__init__(nn.Conv1d, *args, **kwargs)
