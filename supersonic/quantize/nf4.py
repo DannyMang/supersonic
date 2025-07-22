@@ -1,6 +1,9 @@
 
 from tinygrad.tensor import Tensor
+from tinygrad.dtype import dtypes
 from tinygrad.device import device
+
+from typing import Any, Optional, Union
 
 def get_4bit_type(typename:str. device=None, blocksize = 64):
     data = None
@@ -56,11 +59,46 @@ def get_4bit_type(typename:str. device=None, blocksize = 64):
     return data
 
 
+def quantize_fp4(
+    A: Tensor,
+    absmax : Optional[Tensor] = None,
+    out: Optional[Tensor] = None,
+    blocksize=None,
+    compress_statistics=False,
+    quant_storage=dtypes.uint8
+):
+    if blocksize is None:
+        blocksize = 64
+    return quantize_4bit(A,absmax,out,blocksize,compress_statistics,"fp4",quant_storage)
 
 
-def quantize_4bit():
+def quantize_nf4(
+    A: Tensor,
+    absmax : Optional[Tensor] = None,
+    out: Optional[Tensor] = None,
+    blocksize=None,
+    compress_statistics=False,
+    quant_storage=dtypes.uint8
+):
+    if blocksize is None:
+        blocksize = 64
+    return quantize_4bit(A,absmax,out,blocksize,compress_statistics,"nf4",quant_storage)
+
+def quantize_4bit(
+    A: Tensor,
+    absmax: Optional[Tensor] = None,
+    out: Optional[Tensor] = None,
+    blocksize=None,
+    compress_statistics=False,
+    quant_type="fp4",
+    quant_storage=dtypes.uint8,
+) -> tuple[Tensor, QuantState]:
+
     pass
-
+   # TO-DO JULY 22
 
 def dequantize_4bit():
     pass
+
+
+class QuantState:
