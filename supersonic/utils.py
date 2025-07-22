@@ -1,4 +1,5 @@
 from tinygrad.tensor import Tensor
+import json
 
 def dropout(x : Tensor, p: float=0.5, training:bool=True):
     r"""During training, randomly zeroes some elements of the input tensor with probability :attr:`p`.
@@ -17,3 +18,20 @@ def dropout(x : Tensor, p: float=0.5, training:bool=True):
 
     mask = Tensor.rand(*x.shape) > p
     return x * mask / (1-p)
+
+
+def unpack_tensor_to_dict(tensor_data:Tensor):
+    """
+    Unpack a torch tensor into a Python dictionary.
+
+    Parameters:
+    - tensor_data: The torch tensor containing the packed data.
+
+    Returns:
+    A Python dictionary containing the unpacked data.
+    """
+    json_bytes = bytes(tensor_data.numpy())
+    json_str = json_bytes.decode("utf-8")
+    unpacked_dict = json.loads(json_str)
+
+    return unpacked_dict
