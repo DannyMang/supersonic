@@ -7,7 +7,11 @@ import math
 from typing import cast, Optional, List
 from utils import dropout
 
-#import torch.nn as nn
+"""
+sources:
+https://arxiv.org/pdf/2106.09685
+https://github.com/microsoft/LoRA/blob/main/loralib/layers.py
+"""
 
 class LoRALayer():
     def __init__(
