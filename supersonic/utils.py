@@ -1,4 +1,5 @@
 from tinygrad.tensor import Tensor
+from tinygrad.dtype import dtypes
 import json
 
 def dropout(x : Tensor, p: float=0.5, training:bool=True):
@@ -35,3 +36,35 @@ def unpack_tensor_to_dict(tensor_data:Tensor):
     unpacked_dict = json.loads(json_str)
 
     return unpacked_dict
+
+def pack_dict_to_tensor(source_dict):
+    """
+    Pack a dictionary into a torch tensor for storing quant_state items in state_dict.
+
+    Parameters:
+    - source_dict: The dictionary to be packed.
+
+    Returns:
+    A torch tensor containing the packed data.
+    """
+    json_str = json.dumps(source_dict)
+    json_bytes = json_str.encode("utf-8")
+    tensor_data = Tensor(list(json_bytes), dtype=dtypes.uint8)
+
+    return tensor_data
+
+def quantize_to_indices(normalized: Tensor, code: Tensor, quant_type: str) -> Tensor:
+    """Convert normalized values to quantization indices."""
+    # Broadcast for distance computation
+    # normalized: [num_blocks, blocksize] -> [num_blocks, blocksize, 1]
+    # code: [16] -> [1, 1, 16]
+    normalized_expanded = normalized.unsqueeze(-1)
+    code_expanded = code.reshape(1, 1, -1)
+
+    # Compute distances to all quantization values
+    distances = (normalized_expanded - code_expanded).abs()
+
+    # Find nearest neighbor indices
+    indices = distances.argmin(axis=-1)
+
+    return indices.cast(dtypes.uint8)
