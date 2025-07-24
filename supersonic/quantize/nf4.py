@@ -419,5 +419,203 @@ def quantize_to_8bit_indices(normalized: Tensor, code: Tensor) -> Tensor:
     indices = distances.argmin(axis=-1)
     return indices.cast(dtypes.uint8)
 
-def dequantize_4bit():
-    pass
+
+def dequantize_fp4(
+    A:Tensor,
+    quant_state: Optional[QuantState] = None,
+    absmax: Optional[Tensor] = None,
+    out: Optional[Tensor] = None,
+    blocksize: Optional[int] = None,
+) -> Tensor:
+    if blocksize is None:
+        blocksize = 64
+    return dequantize_4bit(A, quant_state, absmax, out, blocksize, "fp4")
+
+
+def dequantize_nf4(
+    A:Tensor,
+    quant_state: Optional[QuantState] = None,
+    absmax: Optional[Tensor] = None,
+    out: Optional[Tensor] = None,
+    blocksize: Optional[int] = None,
+) -> Tensor:
+    if blocksize is None:
+        blocksize = 64
+    return dequantize_4bit(A, quant_state, absmax, out, blocksize, "nf4")
+
+def dequantize_4bit(
+    A: Tensor,
+    quant_state: Optional[QuantState] = None,
+    absmax: Optional[Tensor] = None,
+    out: Optional[Tensor] = None,
+    blocksize: Optional[int] = None,
+    quant_type="fp4",
+) -> Tensor:
+    """Dequantizes a packed 4-bit quantized tensor.
+
+    The input tensor is dequantized by dividing it into blocks of `blocksize` values.
+    The the absolute maximum value within these blocks is used for scaling
+    the non-linear dequantization.
+
+    Args:
+        A (`Tensor`): The quantized input tensor.
+        quant_state ([`QuantState`], *optional*):
+            The quantization state as returned by [`quantize_4bit`].
+            Required if `absmax` is not provided.
+        absmax (`Tensor`, *optional*):
+            A tensor containing the scaling values.
+            Required if `quant_state` is not provided and ignored otherwise.
+        out (`Tensor`, *optional*): A tensor to use to store the result.
+        blocksize (`int`, *optional*):
+            The size of the blocks. Defaults to 128 on ROCm and 64 otherwise.
+            Valid values are 64, 128, 256, 512, 1024, 2048, and 4096.
+        quant_type (`str`, *optional*): The data type to use: `nf4` or `fp4`. Defaults to `fp4`.
+
+    Raises:
+        ValueError: Raised when the input data type or blocksize is not supported.
+
+    Returns:
+        `Tensor`: The dequantized tensor.
+    """
+    if blocksize is None:
+        blocksize = 64
+
+    if quant_state is None:
+        assert absmax is not None and out is not None
+        quant_state = QuantState(
+            absmax=absmax,
+            shape=out.shape,
+            dtype=out.dtype,
+            blocksize=blocksize,
+            quant_type=quant_type,
+        )
+    else:
+        absmax = quant_state.absmax
+        blocksize = quant_state.blocksize
+        quant_type = quant_state.quant_type
+
+    if quant_state.nested:
+        absmax = dequantize_blockwise(quant_state.absmax, quant_state.state2)
+        if quant_state.offset is not None:
+            absmax = cast(Tensor, absmax + quant_state.offset)
+        if absmax.dtype != dtypes.float32:
+            absmax = absmax.float()
+
+    code = cast(Tensor, get_4bit_type(quant_type))
+
+    A_flat = A.flatten()
+
+    dequantized_values = code[A_flat.int()]
+
+    num_blocks = (A_flat.shape[0] + blocksize - 1) // blocksize
+
+    remainder = A_flat.shape[0] % blocksize
+    if remainder != 0:
+        padding = blocksize - remainder
+        dequantized_values = dequantized_values.cat(
+            Tensor.zeros(padding, dtype=dequantized_values.dtype, device=dequantized_values.device)
+        )
+
+    value_blocks = dequantized_values.reshape(num_blocks, blocksize)
+
+    absmax_expanded = absmax.unsqueeze(1)
+    scaled_blocks = cast(Tensor, value_blocks * absmax_expanded)
+
+    result = scaled_blocks.flatten()
+
+    if remainder != 0:
+        result = result[:A_flat.shape[0]]
+
+    if quant_state.shape is not None:
+        result = result.reshape(quant_state.shape)
+
+    if A.shape[0] == 1:
+        result = result.T
+
+    if out is not None:
+        out.assign(result)
+        return out
+
+    return result
+
+
+def dequantize_blockwise(
+    A: Tensor,
+    quant_state: Optional[QuantState] = None,
+    absmax: Optional[Tensor] = None,
+    code: Optional[Tensor] = None,
+    out: Optional[Tensor] = None,
+    blocksize: int = 4096,
+    nested=False,
+) -> Tensor:
+    """Dequantize a tensor in blocks of values.
+
+    The input tensor is dequantized by dividing it into blocks of blocksize values.
+    The absolute maximum value within these blocks is used for scaling
+    the non-linear dequantization.
+
+    Args:
+        A (Tensor): The quantized input tensor.
+        quant_state (QuantState, optional): The quantization state as returned by quantize_blockwise.
+            Required if absmax is not provided.
+        absmax (Tensor, optional): A tensor containing the scaling values.
+            Required if quant_state is not provided and ignored otherwise.
+        code (Tensor, optional): A mapping describing the low-bit data type.
+            Defaults to a signed 8-bit dynamic type.
+            Ignored when quant_state is provided.
+        out (Tensor, optional): A tensor to use to store the result.
+        blocksize (int, optional): The size of the blocks. Defaults to 4096.
+            Valid values are 64, 128, 256, 512, 1024, 2048, and 4096.
+            Ignored when quant_state is provided.
+        nested (bool, optional): Whether this is a nested quantization call.
+
+    Returns:
+        Tensor: The dequantized tensor. The datatype defaults to float32.
+    """
+    assert quant_state is not None or absmax is not None, "Either quant_state or absmax must be provided"
+
+    if code is None and quant_state is None:
+        code = Tensor.linspace(-1.0, 1.0, 256)
+
+    if quant_state is None:
+        quant_state = QuantState(
+            absmax=absmax,
+            code=code,
+            blocksize=blocksize,
+            dtype=dtypes.float32
+        )
+
+    absmax = quant_state.absmax
+    if quant_state.nested:
+        absmax = dequantize_blockwise(quant_state.absmax, quant_state.state2)
+        if quant_state.offset is not None:
+            absmax = cast(Tensor, absmax + quant_state.offset)
+        if absmax.dtype != dtypes.float32:
+            absmax = absmax.float()
+
+    A_flat = A.flatten()
+    dequantized_values = quant_state.code[A_flat.int()]
+    blocksize = quant_state.blocksize
+    num_blocks = (A_flat.shape[0] + blocksize - 1) // blocksize
+
+    remainder = A_flat.shape[0] % blocksize
+    if remainder != 0:
+        padding = blocksize - remainder
+        dequantized_values = dequantized_values.cat(
+            Tensor.zeros(padding, dtype=dequantized_values.dtype, device=dequantized_values.device)
+        )
+    value_blocks = dequantized_values.reshape(num_blocks, blocksize)
+    scaled_blocks = cast(Tensor, value_blocks * absmax_expanded)
+    result = scaled_blocks.flatten()
+
+    if remainder != 0:
+        result = result[:A_flat.shape[0]]
+
+    if result.dtype != quant_state.dtype:
+        result = result.cast(quant_state.dtype)
+
+    if out is not None:
+        out.assign(result)
+        return out
+
+    return result
