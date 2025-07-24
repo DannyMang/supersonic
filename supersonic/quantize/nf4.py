@@ -1,10 +1,10 @@
-
+from __future__ import annotations
 from tinygrad.tensor import Tensor
 from tinygrad.dtype import dtypes
 from tinygrad.device import Device
 from utils import unpack_tensor_to_dict, quantize_to_indices, pack_dict_to_tensor
-
-from typing import Any, Optional, Union
+from tinygrad.uop.mathtraits import MathTrait
+from typing import Any, Optional, Union, cast
 
 class QuantState:
     """container for quantization state components to work with Params4bit and similar classes"""
@@ -213,7 +213,7 @@ def get_4bit_type(typename:str, device=None, blocksize = 64):
     elif typename == "fp4":
         data = Tensor([0, 0.0625, 8.0, 12.0, 4.0, 6.0, 2.0, 3.0, -0, -0.0625, -8.0, -12.0, -4.0, -6.0, -2.0, -3.0])
     elif typename == "int4":
-        data = Tensor([[7, 6, 5, 4, 3, 2, 1, 0, -0, -1, -2, -3, -4, -5, -6, -7]])
+        data = Tensor([7, 6, 5, 4, 3, 2, 1, 0, -0, -1, -2, -3, -4, -5, -6, -7])
     elif typename == "af4":
         # Taken from: NF4 Isn't Information Theoretically Optimal (and that's Good)
         # https://arxiv.org/abs/2306.06965
@@ -307,7 +307,7 @@ def quantize_4bit(
         blocksize = 64
 
     input_shape = A.shape
-    code = get_4bit_type(quant_type)
+    code = cast(Tensor, get_4bit_type(quant_type))
 
     # _out, _absmax = torch.ops.bitsandbytes.quantize_4bit.default(
     #     A,
@@ -322,15 +322,16 @@ def quantize_4bit(
     remainder = n % blocksize
     if remainder != 0:
         padding = blocksize - remainder
-        A_flat = Tensor.cat([A_flat, Tensor.zeros(padding, dtype=A.dtype)])
+        A_flat = A_flat.cat(Tensor.zeros(padding, dtype=A.dtype, device=A.device))
         n = A_flat.shape[0]
 
     num_blocks = n // blocksize
     A_blocks = A_flat.reshape(num_blocks,blocksize)
     _absmax = A_blocks.abs().max(axis=1,keepdim=False)
     #Normalize each block to [-1, 1]
-    normalized = A_blocks / (_absmax.unsqueeze(1) + 1e-8)
-    normalized = normalized.clip(-1.0, 1.0)
+    normalized = cast(Tensor, A_blocks / (_absmax.unsqueeze(1) + 1e-8))
+    normalized = normalized.clamp(-1.0, 1.0)
+    assert isinstance(normalized, Tensor), f"Expected Tensor, got {type(normalized)}"
     _out = quantize_to_indices(normalized, code, quant_type)
 
     #TO-DO pack into 4-bit
@@ -339,7 +340,8 @@ def quantize_4bit(
 
     if compress_statistics:
         offset = _absmax.mean()
-        qabsmax, state2 = quantize_blockwise(_absmax - offset, blocksize=256)
+        absmax_centered = cast(Tensor,_absmax - offset)
+        qabsmax, state2 = quantize_blockwise(absmax_centered, blocksize=256)
         state = QuantState(
             absmax=qabsmax,
             shape=input_shape,
@@ -370,6 +372,52 @@ def quantize_4bit(
         absmax.assign(state.absmax)
 
     return out, state
+
+
+def quantize_blockwise(
+    A: Tensor,
+    code: Optional[Tensor] = None,
+    blocksize=4096,
+    nested=False,
+) -> tuple[Tensor, QuantState]:
+    """Simple blockwise quantization for compress_statistics."""
+
+    if code is None:
+        code = Tensor.linspace(-1.0, 1.0, 256)
+
+    A_flat = A.reshape(-1)
+    n = A_flat.shape[0]
+
+    remainder = n % blocksize
+    if remainder != 0:
+        padding = blocksize - remainder
+        A_flat = A_flat.cat(Tensor.zeros(padding, dtype=A.dtype, device=A.device))
+        n = A_flat.shape[0]
+
+    num_blocks = n // blocksize
+    A_blocks = A_flat.reshape(num_blocks, blocksize)
+
+    _absmax = A_blocks.abs().max(axis=1, keepdim=False)
+    normalized = cast(Tensor, A_blocks / (_absmax.unsqueeze(1) + 1e-8))
+    normalized = normalized.clamp(-1.0, 1.0)
+    _out = quantize_to_8bit_indices(normalized, code)
+
+    state = QuantState(
+        absmax=_absmax,
+        code=code,
+        blocksize=blocksize,
+        dtype=A.dtype
+    )
+
+    return _out, state
+
+def quantize_to_8bit_indices(normalized: Tensor, code: Tensor) -> Tensor:
+    """Quantize to 8-bit indices using 256-value lookup table."""
+    normalized_expanded = normalized.unsqueeze(-1)
+    code_expanded = code.reshape(1, 1, -1)
+    distances = cast(Tensor, normalized_expanded - code_expanded).abs()
+    indices = distances.argmin(axis=-1)
+    return indices.cast(dtypes.uint8)
 
 def dequantize_4bit():
     pass

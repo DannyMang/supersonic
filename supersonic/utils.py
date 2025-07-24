@@ -1,5 +1,6 @@
 from tinygrad.tensor import Tensor
 from tinygrad.dtype import dtypes
+from typing import cast
 import json
 
 def dropout(x : Tensor, p: float=0.5, training:bool=True):
@@ -62,7 +63,8 @@ def quantize_to_indices(normalized: Tensor, code: Tensor, quant_type: str) -> Te
     code_expanded = code.reshape(1, 1, -1)
 
     # Compute distances to all quantization values
-    distances = (normalized_expanded - code_expanded).abs()
+    diff = cast(Tensor, normalized_expanded - code_expanded)
+    distances = diff.abs()
 
     # Find nearest neighbor indices
     indices = distances.argmin(axis=-1)
