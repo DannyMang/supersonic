@@ -2,7 +2,7 @@ from __future__ import annotations
 from tinygrad.tensor import Tensor
 from tinygrad.dtype import dtypes
 from tinygrad.device import Device
-from utils import unpack_tensor_to_dict, quantize_to_indices, pack_dict_to_tensor
+from utils import unpack_tensor_to_dict, quantize_to_indices, pack_dict_to_tensor, pack_4bit_pairs
 from tinygrad.uop.mathtraits import MathTrait
 from typing import Any, Optional, Union, cast
 
@@ -332,12 +332,8 @@ def quantize_4bit(
     normalized = cast(Tensor, A_blocks / (_absmax.unsqueeze(1) + 1e-8))
     normalized = normalized.clamp(-1.0, 1.0)
     assert isinstance(normalized, Tensor), f"Expected Tensor, got {type(normalized)}"
-    _out = quantize_to_indices(normalized, code, quant_type)
-
-    #TO-DO pack into 4-bit
-    #
-    #
-
+    indices= quantize_to_indices(normalized, code, quant_type)
+    packed_out = pack_4bit_pairs(indices)
     if compress_statistics:
         offset = _absmax.mean()
         absmax_centered = cast(Tensor,_absmax - offset)
@@ -361,17 +357,10 @@ def quantize_4bit(
             code=code,
             quant_type=quant_type,
         )
-
-    # Handle optional outputs
-    if out is not None:
-        out.assign(_out)
-    else:
-        out = _out
-
     if absmax is not None:
         absmax.assign(state.absmax)
 
-    return out, state
+    return packed_out , state
 
 
 def quantize_blockwise(
@@ -500,14 +489,16 @@ def dequantize_4bit(
             absmax = cast(Tensor, absmax + quant_state.offset)
         if absmax.dtype != dtypes.float32:
             absmax = absmax.float()
-
+    assert quant_type is not None, "quant_type is null"
     code = cast(Tensor, get_4bit_type(quant_type))
 
     A_flat = A.flatten()
 
     dequantized_values = code[A_flat.int()]
 
-    num_blocks = (A_flat.shape[0] + blocksize - 1) // blocksize
+    flat_size = int(A_flat.shape[0])
+    assert blocksize is not None, "blocksize cannot be None"
+    num_blocks = (flat_size + blocksize - 1) // blocksize
 
     remainder = A_flat.shape[0] % blocksize
     if remainder != 0:
@@ -518,6 +509,7 @@ def dequantize_4bit(
 
     value_blocks = dequantized_values.reshape(num_blocks, blocksize)
 
+    assert absmax is not None, "absmax cannot be None"
     absmax_expanded = absmax.unsqueeze(1)
     scaled_blocks = cast(Tensor, value_blocks * absmax_expanded)
 
@@ -594,6 +586,10 @@ def dequantize_blockwise(
             absmax = absmax.float()
 
     A_flat = A.flatten()
+
+    assert quant_state.code is not None, "quant_state.code cannot be None"
+    assert quant_state.blocksize is not None, "quant_state.blocksize cannot be None"
+
     dequantized_values = quant_state.code[A_flat.int()]
     blocksize = quant_state.blocksize
     num_blocks = (A_flat.shape[0] + blocksize - 1) // blocksize
@@ -605,13 +601,15 @@ def dequantize_blockwise(
             Tensor.zeros(padding, dtype=dequantized_values.dtype, device=dequantized_values.device)
         )
     value_blocks = dequantized_values.reshape(num_blocks, blocksize)
+    assert absmax is not None, "absmax cannot be None"
+    absmax_expanded = absmax.unsqueeze(1)  # Shape: [num_blocks, 1]
     scaled_blocks = cast(Tensor, value_blocks * absmax_expanded)
     result = scaled_blocks.flatten()
 
     if remainder != 0:
         result = result[:A_flat.shape[0]]
 
-    if result.dtype != quant_state.dtype:
+    if quant_state.dtype and result.dtype != quant_state.dtype:
         result = result.cast(quant_state.dtype)
 
     if out is not None:
