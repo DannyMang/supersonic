@@ -2,7 +2,7 @@ from __future__ import annotations
 from tinygrad.tensor import Tensor
 from tinygrad.dtype import dtypes
 from tinygrad.device import Device
-from utils import unpack_tensor_to_dict, quantize_to_indices, pack_dict_to_tensor, pack_4bit_pairs
+from utils import unpack_tensor_to_dict, quantize_to_indices, pack_dict_to_tensor, pack_4bit_pairs, unpack_4bit_pairs
 from tinygrad.uop.mathtraits import MathTrait
 from typing import Any, Optional, Union, cast
 
@@ -490,17 +490,29 @@ def dequantize_4bit(
         if absmax.dtype != dtypes.float32:
             absmax = absmax.float()
     assert quant_type is not None, "quant_type is null"
-    code = cast(Tensor, get_4bit_type(quant_type))
+    code = cast(Tensor, get_4bit_type(quant_type, device=A.device))
 
-    A_flat = A.flatten()
+    if quant_state.shape:
+        if len(quant_state.shape) == 1:
+            target_length = int(quant_state.shape[0])
+        elif len(quant_state.shape) == 2:
+            target_length = int(quant_state.shape[0] * quant_state.shape[1])
+        else:
+            target_length = 1
+            for dim in quant_state.shape:
+                target_length = int(target_length * dim)
+    else:
+        target_length = int(A.shape[0]) * 2
 
-    dequantized_values = code[A_flat.int()]
+    indices = unpack_4bit_pairs(A.flatten(), target_length)
 
-    flat_size = int(A_flat.shape[0])
+    dequantized_values = code[indices.int()]
+
+    flat_size = int(target_length)
     assert blocksize is not None, "blocksize cannot be None"
     num_blocks = (flat_size + blocksize - 1) // blocksize
 
-    remainder = A_flat.shape[0] % blocksize
+    remainder = target_length % blocksize
     if remainder != 0:
         padding = blocksize - remainder
         dequantized_values = dequantized_values.cat(
@@ -516,7 +528,7 @@ def dequantize_4bit(
     result = scaled_blocks.flatten()
 
     if remainder != 0:
-        result = result[:A_flat.shape[0]]
+        result = result[:target_length]
 
     if quant_state.shape is not None:
         result = result.reshape(quant_state.shape)
