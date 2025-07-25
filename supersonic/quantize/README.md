@@ -1,4 +1,7 @@
 to-do 7/24
 
 review
-dequantize_4bit + dequantize_blockwise functions and make sure it works
+entirety of nf4, specifically dequantization + draw it out to make sure it makes sense
+
+
+get started on QLoRA
