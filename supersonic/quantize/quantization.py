@@ -3,6 +3,7 @@ from tinygrad.tensor import Tensor
 from tinygrad.dtype import dtypes
 from tinygrad.device import Device
 from utils import unpack_tensor_to_dict, quantize_to_indices, pack_dict_to_tensor, pack_4bit_pairs, unpack_4bit_pairs
+from config.quantization import SuperSonicConfig
 from tinygrad.uop.mathtraits import MathTrait
 from typing import Any, Optional, Union, cast
 
@@ -636,3 +637,19 @@ def dequantize_blockwise(
         return out
 
     return result
+
+def prepare_model_for_supersonic_training(model, config: SuperSonicConfig):
+    """
+    Prepare model for QLoRA training with SuperSonic quantization
+    """
+    # Convert linear layers to quantized versions
+    # Set up gradient handling
+    # Configure memory optimization
+    pass
+
+def create_supersonic_linear(in_features, out_features, config: SuperSonicConfig):
+    """
+    Create a SuperSonic quantized linear layer compatible with QLoRA
+    """
+    # This will be your Linear4bit equivalent
+    pass
