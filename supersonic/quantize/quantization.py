@@ -1,8 +1,10 @@
-from tinygrad import Tensor
-from typing import Optional, Dict, Sequence
-from dataclasses import dataclass, field
-import numpy as np
-
+from __future__ import annotations
+from tinygrad.tensor import Tensor
+from tinygrad.dtype import dtypes
+from tinygrad.device import Device
+from utils import unpack_tensor_to_dict, quantize_to_indices, pack_dict_to_tensor, pack_4bit_pairs, unpack_4bit_pairs
+from tinygrad.uop.mathtraits import MathTrait
+from typing import Any, Optional, Union, cast
 
 """
 - Block-wise quantization with 64-parameter blocks
@@ -10,172 +12,627 @@ import numpy as np
 - Quantile-based binning for weights
 - Basic dequantization for inference
 """
-@dataclass
-class ModelArguments:
-    model_name_or_path: Optional[str] = field(
-        default="EleutherAI/pythia-12b"
-    )
-    trust_remote_code: Optional[bool] = field(
-        default=False,
-        metadata={"help": "Enable unpickling of arbitrary code in AutoModelForCausalLM#from_pretrained."}
-    )
-    use_auth_token: Optional[bool] = field(
-        default=False,
-        metadata={"help": "Enables using Huggingface auth token from Git Credentials."}
+
+class QuantState:
+    """container for quantization state components to work with Params4bit and similar classes"""
+
+    valid_quant_types = ("fp4", "nf4")
+    valid_qs_type_keys = [f"bitsandbytes__{x}" for x in valid_quant_types]
+    valid_qs_keys = [
+        "absmax", "quant_map", "nested_absmax", "nested_quant_map", "quant_state",
+        "quant_type", "blocksize", "dtype", "shape", "nested_blocksize",
+        "nested_dtype", "nested_offset",
+    ]
+
+    def __init__(
+        self,
+        absmax,
+        shape=None,
+        code=None,
+        blocksize=None,
+        quant_type=None,
+        dtype=None,
+        offset=None,
+        state2=None,
+    ):
+        self.absmax = absmax
+        self.shape = shape
+        self.code = code
+        self.dtype = dtype
+        self.blocksize = blocksize
+        self.quant_type = quant_type
+        self.offset = offset
+        self.state2 = state2
+        self.nested = state2 is not None
+
+    def __getitem__(self, idx):
+        """ensures compatibility with older quant state scheme with nested lists."""
+        if self.nested:
+            list_repr = [
+                self.absmax, self.shape, self.dtype, self.blocksize,
+                [self.offset, self.state2], self.quant_type,
+            ]
+        else:
+            list_repr = [self.absmax, self.shape, self.dtype, self.blocksize, None, self.quant_type]
+        return list_repr[idx]
+
+    @classmethod
+    def from_dict(cls, qs_dict: dict[str, Any], device: str) -> "QuantState":
+        """unpacks components of state_dict into QuantState"""
+        device = Device.canonicalize(device)
+
+        # Find quantization state key
+        qs_key = [k for k, v in qs_dict.items() if "quant_state" in k and isinstance(v, Tensor)]
+        if not len(qs_key) and "quant_type" not in qs_dict:
+            raise ValueError("Expected packed or unpacked quant_state items, found neither")
+        elif len(qs_key) != 1 or qs_key[0].split(".")[-1] not in cls.valid_qs_type_keys:
+            raise ValueError(
+                f"There should be exactly one `quant_state` item with ending from {cls.valid_qs_type_keys}.\nDetected {qs_key}.",
+            )
+
+        # Unpack if necessary
+        if len(qs_key) == 1:
+            first_qs_key = qs_key[0]
+            qs_dict.update(unpack_tensor_to_dict(qs_dict.pop(first_qs_key)))
+
+        qs_dict = {k.split(".")[-1]: v for k, v in qs_dict.items()}  # strip prefixes
+        assert set(qs_dict.keys()).issubset(cls.valid_qs_keys)
+
+        if "nested_absmax" in qs_dict:
+            offset = Tensor([float(qs_dict["nested_offset"])], device=device)
+            state2 = cls(
+                absmax=qs_dict["nested_absmax"].to(device),
+                blocksize=qs_dict["nested_blocksize"],
+                code=qs_dict["nested_quant_map"].to(device),
+                dtype=qs_dict["nested_dtype"],
+            )
+        else:
+            offset, state2 = None, None
+
+        quant_state = cls(
+            quant_type=qs_dict["quant_type"],
+            absmax=qs_dict["absmax"].to(device),
+            blocksize=qs_dict["blocksize"],
+            code=qs_dict["quant_map"].to(device),
+            dtype=qs_dict["dtype"],
+            shape=tuple(qs_dict["shape"]) if qs_dict["shape"] is not None else None,
+            offset=offset,
+            state2=state2,
+        )
+        return quant_state
+
+    def as_dict(self, packed=False):
+        """returns dict of tensors and strings for serialization"""
+
+        if self.quant_type is None:
+            raise ValueError("quant_type cannot be None for serialization")
+        if self.absmax is None:
+            raise ValueError("absmax cannot be None for serialization")
+        if self.blocksize is None:
+            raise ValueError("blocksize cannot be None for serialization")
+        if self.code is None:
+            raise ValueError("code cannot be None for serialization")
+        if self.dtype is None:
+            raise ValueError("dtype cannot be None for serialization")
+
+        qs_dict = {
+            "quant_type": self.quant_type,
+            "absmax": self.absmax,
+            "blocksize": self.blocksize,
+            "quant_map": self.code,
+            "dtype": str(self.dtype),
+            "shape": tuple(self.shape) if self.shape is not None else None,
+        }
+
+        if self.nested:
+            if self.state2 is None:
+                raise ValueError("state2 cannot be None when nested=True")
+            if self.offset is None:
+                raise ValueError("offset cannot be None when nested=True")
+            qs_dict.update({
+                "nested_absmax": self.state2.absmax,
+                "nested_blocksize": self.state2.blocksize,
+                "nested_quant_map": self.state2.code,
+                "nested_dtype": str(self.state2.dtype),
+                "nested_offset": self.offset.item() if hasattr(self.offset, 'item') else float(self.offset),
+            })
+
+        if not packed:
+            return qs_dict
+
+        # Packed format for safetensors
+        qs_packed_dict = {k: v for k, v in qs_dict.items() if isinstance(v, Tensor)}
+        non_tensor_dict = {k: v for k, v in qs_dict.items() if not isinstance(v, Tensor)}
+        qs_packed_dict["quant_state." + "bitsandbytes__" + self.quant_type] = pack_dict_to_tensor(non_tensor_dict)
+        return qs_packed_dict
+
+    def to(self, device):
+        """Move quantization state to specified device"""
+        device = Device.canonicalize(device)
+
+        if self.code is not None:
+            self.code = self.code.to(device)
+        if self.absmax is not None:
+            self.absmax = self.absmax.to(device)
+
+        if self.nested:
+            if self.offset is not None:
+                self.offset = self.offset.to(device)
+            if self.state2 is not None:
+                if self.state2.absmax is not None:
+                    self.state2.absmax = self.state2.absmax.to(device)
+                if self.state2.code is not None:
+                    self.state2.code = self.state2.code.to(device)
+
+    def __eq__(self, other):
+        if not isinstance(other, QuantState):
+            return False
+
+        if self.absmax is not None and other.absmax is not None:
+            absmax_diff = (self.absmax - other.absmax).abs().max()
+            absmax_equal = absmax_diff.item() < 1e-6
+        else:
+            absmax_equal = self.absmax is other.absmax
+
+        if self.code is not None and other.code is not None:
+            code_diff = (self.code - other.code).abs().max()
+            code_equal = code_diff.item() < 1e-6
+        else:
+            code_equal = self.code is other.code
+
+        return (
+            absmax_equal
+            and self.shape == other.shape
+            and code_equal
+            and self.dtype == other.dtype
+            and self.blocksize == other.blocksize
+            and self.quant_type == other.quant_type
+            and (
+                self.offset == other.offset
+                if self.offset is not None and other.offset is not None
+                else self.offset is other.offset
+            )
+            and (
+                self.state2 == other.state2
+                if self.state2 is not None and other.state2 is not None
+                else self.state2 is other.state2
+            )
+        )
+
+
+def get_4bit_type(typename:str, device=None, blocksize = 64):
+    if device is None:
+        device = Device.DEFAULT
+    else:
+        device = Device.canonicalize(device)
+    data = None
+    if typename == "nf4":
+        """
+        NF4 Implementation data type
+        from https://arxiv.org/pdf/2305.14314
+        """
+        data = Tensor([
+            -1.0, -0.6961928009986877, -0.5250730514526367, -0.39491748809814453,
+            -0.28444138169288635, -0.18477343022823334, -0.09105003625154495, 0.0,
+            0.07958029955625534, 0.16093020141124725, 0.24611230194568634, 0.33791524171829224,
+            0.44070982933044434, 0.5626170039176941, 0.7229568362236023, 1.0
+        ])
+    elif typename == "fp4":
+        data = Tensor([0, 0.0625, 8.0, 12.0, 4.0, 6.0, 2.0, 3.0, -0, -0.0625, -8.0, -12.0, -4.0, -6.0, -2.0, -3.0])
+    elif typename == "int4":
+        data = Tensor([7, 6, 5, 4, 3, 2, 1, 0, -0, -1, -2, -3, -4, -5, -6, -7])
+    elif typename == "af4":
+        # Taken from: NF4 Isn't Information Theoretically Optimal (and that's Good)
+        # https://arxiv.org/abs/2306.06965
+        data = Tensor([
+            -1.0,
+            -0.69441008,
+            -0.51243739,
+            -0.3736951,
+            -0.25607552,
+            -0.14982478,
+            -0.04934812,
+            0.0,
+            0.04273164,
+            0.12934483,
+            0.21961274,
+            0.31675666,
+            0.42563882,
+            0.55496234,
+            0.72424863,
+            1.0,
+        ])[::-1]
+    else:
+        raise NotImplementedError("4-bit AbnormalFloats currently only support blocksize 64.")
+
+    if data is None:
+        raise NotImplementedError(f"Typename {typename} not supported")
+
+    data = data/data.abs().max()
+    return data
+
+
+def quantize_fp4(
+    A: Tensor,
+    absmax : Optional[Tensor] = None,
+    out: Optional[Tensor] = None,
+    blocksize=None,
+    compress_statistics=False,
+    quant_storage=dtypes.uint8
+):
+    if blocksize is None:
+        blocksize = 64
+    return quantize_4bit(A,absmax,out,blocksize,compress_statistics,"fp4",quant_storage)
+
+
+def quantize_nf4(
+    A: Tensor,
+    absmax : Optional[Tensor] = None,
+    out: Optional[Tensor] = None,
+    blocksize=None,
+    compress_statistics=False,
+    quant_storage=dtypes.uint8
+):
+    if blocksize is None:
+        blocksize = 64
+    return quantize_4bit(A,absmax,out,blocksize,compress_statistics,"nf4",quant_storage)
+
+def quantize_4bit(
+    A: Tensor,
+    absmax: Optional[Tensor] = None,
+    out: Optional[Tensor] = None,
+    blocksize=None,
+    compress_statistics=False,
+    quant_type="fp4",
+    quant_storage=dtypes.uint8,
+) -> tuple[Tensor, QuantState]:
+
+    """
+    Quantize tensor A in blocks of 4-bit values
+
+    => Divides tensor A into blocks which are then individually quantized
+
+    Args:
+        A(Tensor): Input Tensor. Supports 'float16' or 'float32'
+        absmax (optional): Tensor to store absolute max value
+        out (optional): Tensor to store result
+        blocksize: Size of blocks, Valid values are 64, 128, 256, 512, 1024, 2048, and 4096.
+        compress_statistics: bool to additionally quantize absmax values
+        quant_type: The data type to use: 'nf4' or 'fp4", default is fp4
+        quant_storage: the dtype of the tensor used to store the result, defaults to dtypes.uint8
+
+    Raises:
+        ValueError: Raised when the input data type is not supported.
+
+    Returns:
+        Tuple[`Tensor`, `QuantState`]: A tuple containing the quantization results.
+        - `Tensor`: The quantized tensor with packed 4-bit values.
+        - [`QuantState`]: The state object used to undo the quantization.
+    """
+    if blocksize is None:
+        #blocksize = 64 if not HIP_ENVIRONMENT else 128
+        blocksize = 64
+
+    input_shape = A.shape
+    code = cast(Tensor, get_4bit_type(quant_type))
+
+    # _out, _absmax = torch.ops.bitsandbytes.quantize_4bit.default(
+    #     A,
+    #     blocksize,
+    #     quant_type,
+    #     quant_storage,
+    # )
+
+    A_flat  = A.reshape(-1)
+    n = A_flat.shape[0]
+
+    remainder = n % blocksize
+    if remainder != 0:
+        padding = blocksize - remainder
+        A_flat = A_flat.cat(Tensor.zeros(padding, dtype=A.dtype, device=A.device))
+        n = A_flat.shape[0]
+
+    num_blocks = n // blocksize
+    A_blocks = A_flat.reshape(num_blocks,blocksize)
+    _absmax = A_blocks.abs().max(axis=1,keepdim=False)
+    #Normalize each block to [-1, 1]
+    normalized = cast(Tensor, A_blocks / (_absmax.unsqueeze(1) + 1e-8))
+    normalized = normalized.clamp(-1.0, 1.0)
+    assert isinstance(normalized, Tensor), f"Expected Tensor, got {type(normalized)}"
+    indices= quantize_to_indices(normalized, code, quant_type)
+    packed_out = pack_4bit_pairs(indices)
+    if compress_statistics:
+        offset = _absmax.mean()
+        absmax_centered = cast(Tensor,_absmax - offset)
+        qabsmax, state2 = quantize_blockwise(absmax_centered, blocksize=256)
+        state = QuantState(
+            absmax=qabsmax,
+            shape=input_shape,
+            dtype=A.dtype,
+            blocksize=blocksize,
+            code=code,
+            quant_type=quant_type,
+            offset=offset,
+            state2=state2,
+        )
+    else:
+        state = QuantState(
+            absmax=_absmax,
+            shape=input_shape,
+            dtype=A.dtype,
+            blocksize=blocksize,
+            code=code,
+            quant_type=quant_type,
+        )
+    if absmax is not None:
+        absmax.assign(state.absmax)
+
+    return packed_out , state
+
+
+def quantize_blockwise(
+    A: Tensor,
+    code: Optional[Tensor] = None,
+    blocksize=4096,
+    nested=False,
+) -> tuple[Tensor, QuantState]:
+    """Simple blockwise quantization for compress_statistics."""
+
+    if code is None:
+        code = Tensor.linspace(-1.0, 1.0, 256)
+
+    A_flat = A.reshape(-1)
+    n = A_flat.shape[0]
+
+    remainder = n % blocksize
+    if remainder != 0:
+        padding = blocksize - remainder
+        A_flat = A_flat.cat(Tensor.zeros(padding, dtype=A.dtype, device=A.device))
+        n = A_flat.shape[0]
+
+    num_blocks = n // blocksize
+    A_blocks = A_flat.reshape(num_blocks, blocksize)
+
+    _absmax = A_blocks.abs().max(axis=1, keepdim=False)
+    normalized = cast(Tensor, A_blocks / (_absmax.unsqueeze(1) + 1e-8))
+    normalized = normalized.clamp(-1.0, 1.0)
+    _out = quantize_to_8bit_indices(normalized, code)
+
+    state = QuantState(
+        absmax=_absmax,
+        code=code,
+        blocksize=blocksize,
+        dtype=A.dtype
     )
 
-@dataclass
-class DataArguments:
-    eval_dataset_size: int = field(
-        default=1024, metadata={"help": "Size of validation dataset."}
-    )
-    max_train_samples: Optional[int] = field(
-        default=None,
-        metadata={
-            "help": "For debugging purposes or quicker training, truncate the number of training examples to this "
-            "value if set."
-        },
-    )
-    max_eval_samples: Optional[int] = field(
-        default=None,
-        metadata={
-            "help": "For debugging purposes or quicker training, truncate the number of evaluation examples to this "
-            "value if set."
-        },
-    )
-    source_max_len: int = field(
-        default=1024,
-        metadata={"help": "Maximum source sequence length. Sequences will be right padded (and possibly truncated)."},
-    )
-    target_max_len: int = field(
-        default=256,
-        metadata={"help": "Maximum target sequence length. Sequences will be right padded (and possibly truncated)."},
-    )
-    dataset: str = field(
-        default='alpaca',
-        metadata={"help": "Which dataset to finetune on. See datamodule for options."}
-    )
-    dataset_format: Optional[str] = field(
-        default=None,
-        metadata={"help": "Which dataset format is used. [alpaca|chip2|self-instruct|hh-rlhf]"}
-    )
+    return _out, state
 
-@dataclass
-class TrainingArguments(transformers.Seq2SeqTrainingArguments):
-    cache_dir: Optional[str] = field(
-        default=None
-    )
-    train_on_source: Optional[bool] = field(
-        default=False,
-        metadata={"help": "Whether to train on the input in addition to the target text."}
-    )
-    mmlu_split: Optional[str] = field(
-        default='eval',
-        metadata={"help": "The MMLU split to run on"}
-    )
-    mmlu_dataset: Optional[str] = field(
-        default='mmlu-fs',
-        metadata={"help": "MMLU dataset to use: options are `mmlu-zs` for zero-shot or `mmlu-fs` for few shot."}
-    )
-    do_mmlu_eval: Optional[bool] = field(
-        default=False,
-        metadata={"help": "Whether to run the MMLU evaluation."}
-    )
-    max_mmlu_samples: Optional[int] = field(
-        default=None,
-        metadata={"help": "If set, only evaluates on `max_mmlu_samples` of the MMMLU dataset."}
-    )
-    mmlu_source_max_len: int = field(
-        default=2048,
-        metadata={"help": "Maximum source sequence length for mmlu."}
-    )
-    full_finetune: bool = field(
-        default=False,
-        metadata={"help": "Finetune the entire model without adapters."}
-    )
-    adam8bit: bool = field(
-        default=False,
-        metadata={"help": "Use 8-bit adam."}
-    )
-    double_quant: bool = field(
-        default=True,
-        metadata={"help": "Compress the quantization statistics through double quantization."}
-    )
-    quant_type: str = field(
-        default="nf4",
-        metadata={"help": "Quantization data type to use. Should be one of `fp4` or `nf4`."}
-    )
-    bits: int = field(
-        default=4,
-        metadata={"help": "How many bits to use."}
-    )
-    lora_r: int = field(
-        default=64,
-        metadata={"help": "Lora R dimension."}
-    )
-    lora_alpha: float = field(
-        default=16,
-        metadata={"help": " Lora alpha."}
-    )
-    lora_dropout: float = field(
-        default=0.0,
-        metadata={"help":"Lora dropout."}
-    )
-    max_memory_MB: int = field(
-        default=80000,
-        metadata={"help": "Free memory per gpu."}
-    )
-    report_to: str = field(
-        default='none',
-        metadata={"help": "To use wandb or something else for reporting."}
-    )
-    output_dir: str = field(default='./output', metadata={"help": 'The output dir for logs and checkpoints'})
-    optim: str = field(default='paged_adamw_32bit', metadata={"help": 'The optimizer to be used'})
-    per_device_train_batch_size: int = field(default=1, metadata={"help": 'The training batch size per GPU. Increase for better speed.'})
-    gradient_accumulation_steps: int = field(default=16, metadata={"help": 'How many gradients to accumulate before to perform an optimizer step'})
-    max_steps: int = field(default=10000, metadata={"help": 'How many optimizer update steps to take'})
-    weight_decay: float = field(default=0.0, metadata={"help": 'The L2 weight decay rate of AdamW'}) # use lora dropout instead for regularization if needed
-    learning_rate: float = field(default=0.0002, metadata={"help": 'The learnign rate'})
-    remove_unused_columns: bool = field(default=False, metadata={"help": 'Removed unused columns. Needed to make this codebase work.'})
-    max_grad_norm: float = field(default=0.3, metadata={"help": 'Gradient clipping max norm. This is tuned and works well for all models tested.'})
-    gradient_checkpointing: bool = field(default=True, metadata={"help": 'Use gradient checkpointing. You want to use this.'})
-    do_train: bool = field(default=True, metadata={"help": 'To train or not to train, that is the question?'})
-    lr_scheduler_type: str = field(default='constant', metadata={"help": 'Learning rate schedule. Constant a bit better than cosine, and has advantage for analysis'})
-    warmup_ratio: float = field(default=0.03, metadata={"help": 'Fraction of steps to do a warmup for'})
-    logging_steps: int = field(default=10, metadata={"help": 'The frequency of update steps after which to log the loss'})
-    group_by_length: bool = field(default=True, metadata={"help": 'Group sequences into batches with same length. Saves memory and speeds up training considerably.'})
-    save_strategy: str = field(default='steps', metadata={"help": 'When to save checkpoints'})
-    save_steps: int = field(default=250, metadata={"help": 'How often to save a model'})
-    save_total_limit: int = field(default=40, metadata={"help": 'How many checkpoints to save before the oldest is overwritten'})
+def quantize_to_8bit_indices(normalized: Tensor, code: Tensor) -> Tensor:
+    """Quantize to 8-bit indices using 256-value lookup table."""
+    normalized_expanded = normalized.unsqueeze(-1)
+    code_expanded = code.reshape(1, 1, -1)
+    distances = cast(Tensor, normalized_expanded - code_expanded).abs()
+    indices = distances.argmin(axis=-1)
+    return indices.cast(dtypes.uint8)
 
-@dataclass
-class GenerationArguments:
-    # For more hyperparameters check:
-    # https://huggingface.co/docs/transformers/main_classes/text_generation#transformers.GenerationConfig
-    # Length arguments
-    max_new_tokens: Optional[int] = field(
-        default=256,
-        metadata={"help": "Maximum number of new tokens to be generated in evaluation or prediction loops"
-                          "if predict_with_generate is set."}
-    )
-    min_new_tokens : Optional[int] = field(
-        default=None,
-        metadata={"help": "Minimum number of new tokens to generate."}
-    )
 
-    # Generation strategy
-    do_sample: Optional[bool] = field(default=False)
-    num_beams: Optional[int] = field(default=1)
-    num_beam_groups: Optional[int] = field(default=1)
-    penalty_alpha: Optional[float] = field(default=None)
-    use_cache: Optional[bool] = field(default=True)
+def dequantize_fp4(
+    A:Tensor,
+    quant_state: Optional[QuantState] = None,
+    absmax: Optional[Tensor] = None,
+    out: Optional[Tensor] = None,
+    blocksize: Optional[int] = None,
+) -> Tensor:
+    if blocksize is None:
+        blocksize = 64
+    return dequantize_4bit(A, quant_state, absmax, out, blocksize, "fp4")
 
-    # Hyperparameters for logit manipulation
-    temperature: Optional[float] = field(default=1.0)
-    top_k: Optional[int] = field(default=50)
-    top_p: Optional[float] = field(default=1.0)
-    typical_p: Optional[float] = field(default=1.0)
-    diversity_penalty: Optional[float] = field(default=0.0)
-    repetition_penalty: Optional[float] = field(default=1.0)
-    length_penalty: Optional[float] = field(default=1.0)
-    no_repeat_ngram_size: Optional[int] = field(default=0)
+
+def dequantize_nf4(
+    A:Tensor,
+    quant_state: Optional[QuantState] = None,
+    absmax: Optional[Tensor] = None,
+    out: Optional[Tensor] = None,
+    blocksize: Optional[int] = None,
+) -> Tensor:
+    if blocksize is None:
+        blocksize = 64
+    return dequantize_4bit(A, quant_state, absmax, out, blocksize, "nf4")
+
+def dequantize_4bit(
+    A: Tensor,
+    quant_state: Optional[QuantState] = None,
+    absmax: Optional[Tensor] = None,
+    out: Optional[Tensor] = None,
+    blocksize: Optional[int] = None,
+    quant_type="fp4",
+) -> Tensor:
+    """Dequantizes a packed 4-bit quantized tensor.
+
+    The input tensor is dequantized by dividing it into blocks of `blocksize` values.
+    The the absolute maximum value within these blocks is used for scaling
+    the non-linear dequantization.
+
+    Args:
+        A (`Tensor`): The quantized input tensor.
+        quant_state ([`QuantState`], *optional*):
+            The quantization state as returned by [`quantize_4bit`].
+            Required if `absmax` is not provided.
+        absmax (`Tensor`, *optional*):
+            A tensor containing the scaling values.
+            Required if `quant_state` is not provided and ignored otherwise.
+        out (`Tensor`, *optional*): A tensor to use to store the result.
+        blocksize (`int`, *optional*):
+            The size of the blocks. Defaults to 128 on ROCm and 64 otherwise.
+            Valid values are 64, 128, 256, 512, 1024, 2048, and 4096.
+        quant_type (`str`, *optional*): The data type to use: `nf4` or `fp4`. Defaults to `fp4`.
+
+    Raises:
+        ValueError: Raised when the input data type or blocksize is not supported.
+
+    Returns:
+        `Tensor`: The dequantized tensor.
+    """
+    if blocksize is None:
+        blocksize = 64
+
+    if quant_state is None:
+        assert absmax is not None and out is not None
+        quant_state = QuantState(
+            absmax=absmax,
+            shape=out.shape,
+            dtype=out.dtype,
+            blocksize=blocksize,
+            quant_type=quant_type,
+        )
+    else:
+        absmax = quant_state.absmax
+        blocksize = quant_state.blocksize
+        quant_type = quant_state.quant_type
+
+    if quant_state.nested:
+        absmax = dequantize_blockwise(quant_state.absmax, quant_state.state2)
+        if quant_state.offset is not None:
+            absmax = cast(Tensor, absmax + quant_state.offset)
+        if absmax.dtype != dtypes.float32:
+            absmax = absmax.float()
+    assert quant_type is not None, "quant_type is null"
+    code = cast(Tensor, get_4bit_type(quant_type, device=A.device))
+
+    if quant_state.shape:
+        if len(quant_state.shape) == 1:
+            target_length = int(quant_state.shape[0])
+        elif len(quant_state.shape) == 2:
+            target_length = int(quant_state.shape[0] * quant_state.shape[1])
+        else:
+            target_length = 1
+            for dim in quant_state.shape:
+                target_length = int(target_length * dim)
+    else:
+        target_length = int(A.shape[0]) * 2
+
+    indices = unpack_4bit_pairs(A.flatten(), target_length)
+
+    dequantized_values = code[indices.int()]
+
+    flat_size = int(target_length)
+    assert blocksize is not None, "blocksize cannot be None"
+    num_blocks = (flat_size + blocksize - 1) // blocksize
+
+    remainder = target_length % blocksize
+    if remainder != 0:
+        padding = blocksize - remainder
+        dequantized_values = dequantized_values.cat(
+            Tensor.zeros(padding, dtype=dequantized_values.dtype, device=dequantized_values.device)
+        )
+
+    value_blocks = dequantized_values.reshape(num_blocks, blocksize)
+
+    assert absmax is not None, "absmax cannot be None"
+    absmax_expanded = absmax.unsqueeze(1)
+    scaled_blocks = cast(Tensor, value_blocks * absmax_expanded)
+
+    result = scaled_blocks.flatten()
+
+    if remainder != 0:
+        result = result[:target_length]
+
+    if quant_state.shape is not None:
+        result = result.reshape(quant_state.shape)
+
+    if A.shape[0] == 1:
+        result = result.T
+
+    if out is not None:
+        out.assign(result)
+        return out
+
+    return result
+
+
+def dequantize_blockwise(
+    A: Tensor,
+    quant_state: Optional[QuantState] = None,
+    absmax: Optional[Tensor] = None,
+    code: Optional[Tensor] = None,
+    out: Optional[Tensor] = None,
+    blocksize: int = 4096,
+    nested=False,
+) -> Tensor:
+    """Dequantize a tensor in blocks of values.
+
+    The input tensor is dequantized by dividing it into blocks of blocksize values.
+    The absolute maximum value within these blocks is used for scaling
+    the non-linear dequantization.
+
+    Args:
+        A (Tensor): The quantized input tensor.
+        quant_state (QuantState, optional): The quantization state as returned by quantize_blockwise.
+            Required if absmax is not provided.
+        absmax (Tensor, optional): A tensor containing the scaling values.
+            Required if quant_state is not provided and ignored otherwise.
+        code (Tensor, optional): A mapping describing the low-bit data type.
+            Defaults to a signed 8-bit dynamic type.
+            Ignored when quant_state is provided.
+        out (Tensor, optional): A tensor to use to store the result.
+        blocksize (int, optional): The size of the blocks. Defaults to 4096.
+            Valid values are 64, 128, 256, 512, 1024, 2048, and 4096.
+            Ignored when quant_state is provided.
+        nested (bool, optional): Whether this is a nested quantization call.
+
+    Returns:
+        Tensor: The dequantized tensor. The datatype defaults to float32.
+    """
+    assert quant_state is not None or absmax is not None, "Either quant_state or absmax must be provided"
+
+    if code is None and quant_state is None:
+        code = Tensor.linspace(-1.0, 1.0, 256)
+
+    if quant_state is None:
+        quant_state = QuantState(
+            absmax=absmax,
+            code=code,
+            blocksize=blocksize,
+            dtype=dtypes.float32
+        )
+
+    absmax = quant_state.absmax
+    if quant_state.nested:
+        absmax = dequantize_blockwise(quant_state.absmax, quant_state.state2)
+        if quant_state.offset is not None:
+            absmax = cast(Tensor, absmax + quant_state.offset)
+        if absmax.dtype != dtypes.float32:
+            absmax = absmax.float()
+
+    A_flat = A.flatten()
+
+    assert quant_state.code is not None, "quant_state.code cannot be None"
+    assert quant_state.blocksize is not None, "quant_state.blocksize cannot be None"
+
+    dequantized_values = quant_state.code[A_flat.int()]
+    blocksize = quant_state.blocksize
+    num_blocks = (A_flat.shape[0] + blocksize - 1) // blocksize
+
+    remainder = A_flat.shape[0] % blocksize
+    if remainder != 0:
+        padding = blocksize - remainder
+        dequantized_values = dequantized_values.cat(
+            Tensor.zeros(padding, dtype=dequantized_values.dtype, device=dequantized_values.device)
+        )
+    value_blocks = dequantized_values.reshape(num_blocks, blocksize)
+    assert absmax is not None, "absmax cannot be None"
+    absmax_expanded = absmax.unsqueeze(1)  # Shape: [num_blocks, 1]
+    scaled_blocks = cast(Tensor, value_blocks * absmax_expanded)
+    result = scaled_blocks.flatten()
+
+    if remainder != 0:
+        result = result[:A_flat.shape[0]]
+
+    if quant_state.dtype and result.dtype != quant_state.dtype:
+        result = result.cast(quant_state.dtype)
+
+    if out is not None:
+        out.assign(result)
+        return out
+
+    return result
