@@ -4,14 +4,38 @@
 - Memory-efficient gradient computation
 - Integration with your existing Linear layers
 
+
+
+
+class SuperSonicLinear4bit(LoRALinear):
+
+        The core QLoRA layer - inherits LoRA capabilities + adds quantization
+
+    def __init__(self, in_features, out_features, config, lora_config):
+        super().__init__(in_features, out_features, **lora_config)
+
+    def forward(self, x):
+        # To_DO JULY 26!!!
+        pass
+
+
+
 https://arxiv.org/pdf/2305.14314
 """
+import os
+import sys
+import logging
+import pandas as pd
 from tinygrad.tensor import Tensor
 from typing import Optional, Dict, Sequence
 from dataclasses import dataclass, field
+from datasets import load_dataset, Dataset
 import numpy as np
 from .lora import Linear as LoRALinear
 from .quantization import quantize_4bit, dequantize_4bit, QuantState
+import transformers
+
+from tinygrad.nn.state import torch_load, safe_load, load_state_dict
 
 
 @dataclass
@@ -152,6 +176,8 @@ class DataArguments:
 #     save_steps: int = field(default=250, metadata={"help": 'How often to save a model'})
 #     save_total_limit: int = field(default=40, metadata={"help": 'How many checkpoints to save before the oldest is overwritten'})
 
+
+git
 @dataclass
 class GenerationArguments:
     # For more hyperparameters check:
@@ -184,13 +210,507 @@ class GenerationArguments:
     length_penalty: Optional[float] = field(default=1.0)
     no_repeat_ngram_size: Optional[int] = field(default=0)
 
-class SuperSonicLinear4bit(LoRALinear):
-    """
-        The core QLoRA layer - inherits LoRA capabilities + adds quantization
-    """
-    def __init__(self, in_features, out_features, config, lora_config):
-        super().__init__(in_features, out_features, **lora_config)
 
-    def forward(self, x):
-        # To_DO JULY 26!!!
-        pass
+
+class SavePeftModelCallback(transformers.TrainerCallback):
+    def save_model(self, args, state, kwargs):
+        print('Saving PEFT checkpoint...')
+        if state.best_model_checkpoint is not None:
+            checkpoint_folder = os.path.join(state.best_model_checkpoint, "adapter_model")
+        else:
+            checkpoint_folder = os.path.join(args.output_dir, f"{PREFIX_CHECKPOINT_DIR}-{state.global_step}")
+
+        peft_model_path = os.path.join(checkpoint_folder, "adapter_model")
+        kwargs["model"].save_pretrained(peft_model_path)
+
+        pytorch_model_path = os.path.join(checkpoint_folder, "pytorch_model.bin")
+        if os.path.exists(pytorch_model_path):
+            os.remove(pytorch_model_path)
+
+    def on_save(self, args, state, control, **kwargs):
+        self.save_model(args, state, kwargs)
+        return control
+
+    def on_train_end(self, args, state, control, **kwargs):
+        def touch(fname, times=None):
+            with open(fname, 'a'):
+                os.utime(fname, times)
+
+        touch(join(args.output_dir, 'completed'))
+        self.save_model(args, state, kwargs)
+
+def get_accelerate_model(args, checkpoint_dir):
+    # TO-DO :function will  INIT MODEL ARCHITECTURE
+    #
+    # 1) Hardware:
+    #device = setup_tinygrad_devices(args)
+    #
+    # 2) model
+    #model = create_tinygrad_model(args.model_name_or_path)
+
+    # or Load pretrained weights from HuggingFace/PyTorch
+    if args.model_name_or_path.endswith('.safetensors'):
+        weights = safe_load(args.model_name_or_path)
+    else:
+        model_path = download_hf_model(args.model_name_or_path)
+        weights = torch_load(model_path)
+
+    #TO-DO Handle HuggingFace -> tinygrad key mapping if needed TO_DO
+   # weights = convert_hf_to_tinygrad_keys(weights)
+
+    # Load weights into model
+    load_state_dict(model, weights, strict=False)
+
+    """
+
+    just some references on how some helpful functions that can implemnet this part
+
+    basically get_accelerate_model will
+    1.setup hardware/ detect GPUs/ config device mapping for multi-gpu or perhaps multi-training
+    2. model loading such as AutoModelForCausalLM.from_pretrained()
+    3. model configurations // configuring compute dtype based on hardware
+    4. tokenizer setup
+    5. qLoRA prep => prepare_model_for_kbit_training()
+
+
+
+
+    from tinygrad.nn.state import torch_load, load_state_dict
+
+    # Load PyTorch weights directly
+    weights = torch_load("model.pth")  # or from HuggingFace hub
+    load_state_dict(model, weights)
+        ________________________________________________________
+    from tinygrad.nn.state import safe_load, load_state_dict
+
+    # Load safetensors (preferred format)
+    weights = safe_load("model.safetensors")
+    load_state_dict(model, weights)
+
+    ________________________________________________________
+
+
+    weights = load("model.gguf")  # Handles GGUF automatically
+    load_state_dict(model, weights)
+
+    """
+
+    # TO_DO Apply quantization and LoRA
+    #model = prepare_model_for_qlora(model, args)
+
+    return model, tokenizer
+
+def print_trainable_parameters(args, model):
+    """
+    Prints the number of trainable parameters in the model.
+    """
+    trainable_params = 0
+    all_param = 0
+    for _, param in model.named_parameters():
+        all_param += param.numel()
+        if param.requires_grad:
+            trainable_params += param.numel()
+    if args.bits == 4: trainable_params /= 2
+    print(
+        f"trainable params: {trainable_params} || "
+        f"all params: {all_param} || "
+        f"trainable: {100 * trainable_params / all_param}"
+    )
+
+
+@dataclass
+class DataCollatorForCausalLM(object):
+    tokenizer: transformers.PreTrainedTokenizer
+    source_max_len: int
+    target_max_len: int
+    train_on_source: bool
+    predict_with_generate: bool
+
+    def __call__(self, instances: Sequence[Dict]) -> Dict[str, torch.Tensor]:
+        # Extract elements
+        sources = [f"{self.tokenizer.bos_token}{example['input']}" for example in instances]
+        targets = [f"{example['output']}{self.tokenizer.eos_token}" for example in instances]
+        # Tokenize
+        tokenized_sources_with_prompt = self.tokenizer(
+            sources,
+            max_length=self.source_max_len,
+            truncation=True,
+            add_special_tokens=False,
+        )
+        tokenized_targets = self.tokenizer(
+            targets,
+            max_length=self.target_max_len,
+            truncation=True,
+            add_special_tokens=False,
+        )
+        # Build the input and labels for causal LM
+        input_ids = []
+        labels = []
+        for tokenized_source, tokenized_target in zip(
+            tokenized_sources_with_prompt['input_ids'],
+            tokenized_targets['input_ids']
+        ):
+            if not self.predict_with_generate:
+                input_ids.append(Tensor(tokenized_source + tokenized_target))
+                if not self.train_on_source:
+                    labels.append(
+                        Tensor([IGNORE_INDEX for _ in range(len(tokenized_source))] + copy.deepcopy(tokenized_target))
+                    )
+                else:
+                    labels.append(Tensor(copy.deepcopy(tokenized_source + tokenized_target)))
+            else:
+                input_ids.append(Tensor(tokenized_source))
+        # Apply padding
+        input_ids = pad_sequence(input_ids, batch_first=True, padding_value=self.tokenizer.pad_token_id)
+        labels = pad_sequence(labels, batch_first=True, padding_value=IGNORE_INDEX) if not self.predict_with_generate else None
+        data_dict = {
+            'input_ids': input_ids,
+            'attention_mask':input_ids.ne(self.tokenizer.pad_token_id),
+        }
+        if labels is not None:
+            data_dict['labels'] = labels
+        return data_dict
+
+def extract_unnatural_instructions_data(examples, extract_reformulations=False):
+    out = {
+        'input': [],
+        'output': [],
+    }
+    for example_instances in examples['instances']:
+        for instance in example_instances:
+            out['input'].append(instance['instruction_with_input'])
+            out['output'].append(instance['output'])
+    if extract_reformulations:
+        for example_reformulations in examples['reformulations']:
+            if example_reformulations is not None:
+                for instance in example_reformulations:
+                    out['input'].append(instance['instruction_with_input'])
+                    out['output'].append(instance['output'])
+    return out
+
+ALPACA_PROMPT_DICT = {
+    "prompt_input": (
+        "Below is an instruction that describes a task, paired with an input that provides further context. "
+        "Write a response that appropriately completes the request.\n\n"
+        "### Instruction:\n{instruction}\n\n### Input:\n{input}\n\n### Response: "
+    ),
+    "prompt_no_input": (
+        "Below is an instruction that describes a task. "
+        "Write a response that appropriately completes the request.\n\n"
+        "### Instruction:\n{instruction}\n\n### Response: "
+    ),
+}
+
+def extract_alpaca_dataset(example):
+    if example.get("input", "") != "":
+        prompt_format = ALPACA_PROMPT_DICT["prompt_input"]
+    else:
+        prompt_format = ALPACA_PROMPT_DICT["prompt_no_input"]
+    return {'input': prompt_format.format(**example)}
+
+def local_dataset(dataset_name):
+    if dataset_name.endswith('.json') or dataset_name.endswith('.jsonl'):
+        full_dataset = Dataset.from_json(path_or_paths=dataset_name)
+    elif dataset_name.endswith('.csv'):
+        full_dataset = Dataset.from_pandas(pd.read_csv(dataset_name))
+    elif dataset_name.endswith('.tsv'):
+        full_dataset = Dataset.from_pandas(pd.read_csv(dataset_name, delimiter='\t'))
+    else:
+        raise ValueError(f"Unsupported dataset format: {dataset_name}")
+
+    split_dataset = full_dataset.train_test_split(test_size=0.1)
+    return split_dataset
+
+def make_data_module(tokenizer: transformers.PreTrainedTokenizer, args) -> Dict:
+    """
+    Make dataset and collator for supervised fine-tuning.
+    Datasets are expected to have the following columns: { `input`, `output` }
+
+    Available datasets to be selected with `dataset` argument:
+        - alpaca, 52002 examples
+        - alpaca cleaned, 51942 examples
+        - chip2 (OIG), 210289 examples
+        - self-instruct, 82612 examples
+        - hh-rlhf (Anthropic), 160800 examples
+        - longform, 23.7k examples
+        - oasst1 (OpenAssistant) primary message tree only, 9,846 examples
+
+    Coming soon:
+        - unnatural instructions core, 66010 examples
+        - unnatural instructions full, 240670 examples
+        - alpaca-gpt4, 52002 examples
+        - unnatural-instructions-gpt4, 9000 examples
+        - supernatural-instructions, 69624 examples (same as paper with 100 ex/task more can be used)
+        - flan (FLAN v2), up to 20M examples available
+        - vicuna
+
+    """
+    def load_data(dataset_name):
+        if dataset_name == 'alpaca':
+            return load_dataset("tatsu-lab/alpaca")
+        elif dataset_name == 'alpaca-clean':
+            return load_dataset("yahma/alpaca-cleaned")
+        elif dataset_name == 'chip2':
+            return load_dataset("laion/OIG", data_files='unified_chip2.jsonl')
+        elif dataset_name == 'self-instruct':
+            return load_dataset("yizhongw/self_instruct", name='self_instruct')
+        elif dataset_name == 'hh-rlhf':
+            return load_dataset("Anthropic/hh-rlhf")
+        elif dataset_name == 'longform':
+            return load_dataset("akoksal/LongForm")
+        elif dataset_name == 'oasst1':
+            return load_dataset("timdettmers/openassistant-guanaco")
+        elif dataset_name == 'vicuna':
+            raise NotImplementedError("Vicuna data was not released.")
+        else:
+            if os.path.exists(dataset_name):
+                try:
+                    args.dataset_format = args.dataset_format if args.dataset_format else "input-output"
+                    full_dataset = local_dataset(dataset_name)
+                    return full_dataset
+                except:
+                    raise ValueError(f"Error loading dataset from {dataset_name}")
+            else:
+                raise NotImplementedError(f"Dataset {dataset_name} not implemented yet.")
+
+    def format_dataset(dataset, dataset_format):
+        if (
+            dataset_format == 'alpaca' or dataset_format == 'alpaca-clean' or
+            (dataset_format is None and args.dataset in ['alpaca', 'alpaca-clean'])
+        ):
+            dataset = dataset.map(extract_alpaca_dataset, remove_columns=['instruction'])
+        elif dataset_format == 'chip2' or (dataset_format is None and args.dataset == 'chip2'):
+            dataset = dataset.map(lambda x: {
+                'input': x['text'].split('\n<bot>: ')[0].replace('<human>: ', ''),
+                'output': x['text'].split('\n<bot>: ')[1],
+            })
+        elif dataset_format == 'self-instruct' or (dataset_format is None and args.dataset == 'self-instruct'):
+            for old, new in [["prompt", "input"], ["completion", "output"]]:
+                dataset = dataset.rename_column(old, new)
+        elif dataset_format == 'hh-rlhf' or (dataset_format is None and args.dataset == 'hh-rlhf'):
+            dataset = dataset.map(lambda x: {
+                'input': '',
+                'output': x['chosen']
+            })
+        elif dataset_format == 'oasst1' or (dataset_format is None and args.dataset == 'oasst1'):
+            dataset = dataset.map(lambda x: {
+                'input': '',
+                'output': x['text'],
+            })
+        elif dataset_format == 'input-output':
+            # leave as is
+            pass
+        # Remove unused columns.
+        dataset = dataset.remove_columns(
+            [col for col in dataset.column_names['train'] if col not in ['input', 'output']]
+        )
+        return dataset
+
+     # Load dataset.
+    dataset = load_data(args.dataset)
+    dataset = format_dataset(dataset, args.dataset_format)
+
+    # Split train/eval, reduce size
+    if args.do_eval or args.do_predict:
+        if 'eval' in dataset:
+            eval_dataset = dataset['eval']
+        else:
+            print('Splitting train dataset in train and validation according to `eval_dataset_size`')
+            dataset = dataset["train"].train_test_split(
+                test_size=args.eval_dataset_size, shuffle=True, seed=42
+            )
+            eval_dataset = dataset['test']
+        if args.max_eval_samples is not None and len(eval_dataset) > args.max_eval_samples:
+            eval_dataset = eval_dataset.select(range(args.max_eval_samples))
+        if args.group_by_length:
+            eval_dataset = eval_dataset.map(lambda x: {'length': len(x['input']) + len(x['output'])})
+    if args.do_train:
+        train_dataset = dataset['train']
+        if args.max_train_samples is not None and len(train_dataset) > args.max_train_samples:
+            train_dataset = train_dataset.select(range(args.max_train_samples))
+        if args.group_by_length:
+            train_dataset = train_dataset.map(lambda x: {'length': len(x['input']) + len(x['output'])})
+
+    data_collator = DataCollatorForCausalLM(
+        tokenizer=tokenizer,
+        source_max_len=args.source_max_len,
+        target_max_len=args.target_max_len,
+        train_on_source=args.train_on_source,
+        predict_with_generate=args.predict_with_generate,
+    )
+    return dict(
+        train_dataset=train_dataset if args.do_train else None,
+        eval_dataset=eval_dataset if args.do_eval else None,
+        predict_dataset=eval_dataset if args.do_predict else None,
+        data_collator=data_collator
+    )
+
+def get_last_checkpoint(checkpoint_dir):
+    if isdir(checkpoint_dir):
+        is_completed = exists(join(checkpoint_dir, 'completed'))
+        if is_completed: return None, True # already finished
+        max_step = 0
+        for filename in os.listdir(checkpoint_dir):
+            if isdir(join(checkpoint_dir, filename)) and filename.startswith('checkpoint'):
+                max_step = max(max_step, int(filename.replace('checkpoint-', '')))
+        if max_step == 0: return None, is_completed # training started, but no checkpoint
+        checkpoint_dir = join(checkpoint_dir, f'checkpoint-{max_step}')
+        print(f"Found a previous checkpoint at: {checkpoint_dir}")
+        return checkpoint_dir, is_completed # checkpoint found!
+    return None, False # first training
+
+
+def train():
+    hfparser = transformers.HfArgumentParser((
+        ModelArguments, DataArguments, TrainingArguments, GenerationArguments
+    ))
+    model_args, data_args, training_args, generation_args, extra_args = \
+        hfparser.parse_args_into_dataclasses(return_remaining_strings=True)
+    training_args.generation_config = transformers.GenerationConfig(**vars(generation_args))
+    args = argparse.Namespace(
+        **vars(model_args), **vars(data_args), **vars(training_args)
+    )
+    print(args)
+
+    checkpoint_dir, completed_training = get_last_checkpoint(args.output_dir)
+    if completed_training:
+        print('Detected that training was already completed!')
+
+    model, tokenizer = get_accelerate_model(args, checkpoint_dir)
+
+    model.config.use_cache = False
+    print('loaded model')
+    set_seed(args.seed)
+
+    data_module = make_data_module(tokenizer=tokenizer, args=args)
+
+    trainer = Seq2SeqTrainer(
+        model=model,
+        tokenizer=tokenizer,
+        args=training_args,
+        **{k:v for k,v in data_module.items() if k != 'predict_dataset'},
+    )
+
+    # Callbacks
+    if not args.full_finetune:
+        trainer.add_callback(SavePeftModelCallback)
+    if args.do_mmlu_eval:
+        if args.mmlu_dataset == 'mmlu-zs':
+            mmlu_dataset = load_dataset("json", data_files={
+                'eval': 'data/mmlu/zero_shot_mmlu_val.json',
+                'test': 'data/mmlu/zero_shot_mmlu_test.json',
+            })
+            mmlu_dataset = mmlu_dataset.remove_columns('subject')
+        # MMLU Five-shot (Eval/Test only)
+        elif args.mmlu_dataset == 'mmlu' or args.mmlu_dataset == 'mmlu-fs':
+            mmlu_dataset = load_dataset("json", data_files={
+                'eval': 'data/mmlu/five_shot_mmlu_val.json',
+                'test': 'data/mmlu/five_shot_mmlu_test.json',
+            })
+            # mmlu_dataset = mmlu_dataset.remove_columns('subject')
+        mmlu_dataset = mmlu_dataset[args.mmlu_split]
+        if args.max_mmlu_samples is not None:
+            mmlu_dataset = mmlu_dataset.select(range(args.max_mmlu_samples))
+        abcd_idx = [
+            tokenizer("A", add_special_tokens=False).input_ids[0],
+            tokenizer("B", add_special_tokens=False).input_ids[0],
+            tokenizer("C", add_special_tokens=False).input_ids[0],
+            tokenizer("D", add_special_tokens=False).input_ids[0],
+        ]
+        accuracy = evaluate.load("accuracy")
+        class MMLUEvalCallback(transformers.TrainerCallback):
+            def on_evaluate(self, args, state, control, model, **kwargs):
+                data_loader = trainer.get_eval_dataloader(mmlu_dataset)
+                source_max_len = trainer.data_collator.source_max_len
+                trainer.data_collator.source_max_len = args.mmlu_source_max_len
+                trainer.model.eval()
+                preds, refs = [], []
+                loss_mmlu = 0
+                for batch in tqdm(data_loader, total=len(data_loader)):
+                    (loss, logits, labels) = trainer.prediction_step(trainer.model,batch,prediction_loss_only=False,)
+                    # There are two tokens, the output, and eos token.
+                    for i, logit in enumerate(logits):
+                        label_non_zero_id = (batch['labels'][i] != -100).nonzero()[0][0]
+                        logit_abcd = logit[label_non_zero_id-1][abcd_idx]
+                        preds.append(torch.argmax(logit_abcd).item())
+                    labels = labels[labels != IGNORE_INDEX].view(-1, 2)[:,0]
+                    refs += [abcd_idx.index(label) for label in labels.tolist()]
+                    loss_mmlu += loss.item()
+                # Extract results by subject.
+                results = {'mmlu_loss':loss_mmlu/len(data_loader)}
+                subject = mmlu_dataset['subject']
+                subjects = {s:{'refs':[], 'preds':[]} for s in set(subject)}
+                for s,p,r in zip(subject, preds, refs):
+                    subjects[s]['preds'].append(p)
+                    subjects[s]['refs'].append(r)
+                subject_scores = []
+                for subject in subjects:
+                    subject_score = accuracy.compute(
+                        references=subjects[subject]['refs'],
+                        predictions=subjects[subject]['preds']
+                    )['accuracy']
+                    results[f'mmlu_{args.mmlu_split}_accuracy_{subject}'] = subject_score
+                    subject_scores.append(subject_score)
+                results[f'mmlu_{args.mmlu_split}_accuracy'] = np.mean(subject_scores)
+                trainer.log(results)
+                trainer.data_collator.source_max_len = source_max_len
+
+        trainer.add_callback(MMLUEvalCallback)
+
+    # Verifying the datatypes and parameter counts before training.
+    print_trainable_parameters(args, model)
+    dtypes = {}
+    for _, p in model.named_parameters():
+        dtype = p.dtype
+        if dtype not in dtypes: dtypes[dtype] = 0
+        dtypes[dtype] += p.numel()
+    total = 0
+    for k, v in dtypes.items(): total+= v
+    for k, v in dtypes.items():
+        print(k, v, v/total)
+
+    all_metrics = {"run_name": args.run_name}
+    # Training
+    if args.do_train:
+        logger.info("*** Train ***")
+        # Note: `resume_from_checkpoint` not supported for adapter checkpoints by HF.
+        # Currently adapter checkpoint is reloaded as expected but optimizer/scheduler states are not.
+        train_result = trainer.train()
+        metrics = train_result.metrics
+        trainer.log_metrics("train", metrics)
+        trainer.save_metrics("train", metrics)
+        trainer.save_state()
+        all_metrics.update(metrics)
+    # Evaluation
+    if args.do_eval:
+        logger.info("*** Evaluate ***")
+        metrics = trainer.evaluate(metric_key_prefix="eval")
+        trainer.log_metrics("eval", metrics)
+        trainer.save_metrics("eval", metrics)
+        all_metrics.update(metrics)
+    # Prediction
+    if args.do_predict:
+        logger.info("*** Predict ***")
+        prediction_output = trainer.predict(test_dataset=data_module['predict_dataset'],metric_key_prefix="predict")
+        prediction_metrics = prediction_output.metrics
+        predictions = prediction_output.predictions
+        predictions = np.where(predictions != -100, predictions, tokenizer.pad_token_id)
+        predictions = tokenizer.batch_decode(
+            predictions, skip_special_tokens=True, clean_up_tokenization_spaces=True
+        )
+        with open(os.path.join(args.output_dir, 'predictions.jsonl'), 'w') as fout:
+            for i, example in enumerate(data_module['predict_dataset']):
+                example['prediction_with_input'] = predictions[i].strip()
+                example['prediction'] = predictions[i].replace(example['input'], '').strip()
+                fout.write(json.dumps(example) + '\n')
+        print(prediction_metrics)
+        trainer.log_metrics("predict", prediction_metrics)
+        trainer.save_metrics("predict", prediction_metrics)
+        all_metrics.update(prediction_metrics)
+
+    if (args.do_train or args.do_eval or args.do_predict):
+        with open(os.path.join(args.output_dir, "metrics.json"), "w") as fout:
+            fout.write(json.dumps(all_metrics))
+
+if __name__ == "__main__":
+    train()
