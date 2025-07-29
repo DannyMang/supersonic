@@ -1,34 +1,79 @@
-"""
-- Combine your existing LoRA with NF4 quantization
-- 4-bit weight storage + BFloat16 compute
-- Memory-efficient gradient computation
-- Integration with your existing Linear layers
+# This source code is licensed under the MIT license found in the
+# LICENSE file in the root directory of this source tree.
 
-
-https://arxiv.org/pdf/2305.14314
-"""
-import os
-import sys
-import logging
-import pandas as pd
+from collections import defaultdict
 import copy
 import json
+import os
 from os.path import exists, join, isdir
-from tinygrad.tensor import Tensor
-from typing import Optional, Dict, Sequence
 from dataclasses import dataclass, field
-from datasets import load_dataset, Dataset
+import sys
+from typing import Optional, Dict, Sequence
 import numpy as np
-from .lora import Linear as LoRALinear
-from .quantization import quantize_4bit, dequantize_4bit, QuantState
+from tqdm import tqdm
+import logging
+import bitsandbytes as bnb
+import pandas as pd
+import importlib
+from packaging import version
+from packaging.version import parse
+
+import torch
 import transformers
+from torch.nn.utils.rnn import pad_sequence
+import argparse
+from transformers import (
+    AutoTokenizer,
+    AutoModelForCausalLM,
+    set_seed,
+    Seq2SeqTrainer,
+    BitsAndBytesConfig,
+    LlamaTokenizer
+
+)
+from datasets import load_dataset, Dataset
+import evaluate
+
+from peft import (
+    prepare_model_for_kbit_training,
+    LoraConfig,
+    get_peft_model,
+    PeftModel
+)
+from peft.tuners.lora import LoraLayer
 from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
 
-from tinygrad.nn.state import torch_load, safe_load, load_state_dict
 
-# Constants
+def is_ipex_available():
+    def get_major_and_minor_from_version(full_version):
+        return str(version.parse(full_version).major) + "." + str(version.parse(full_version).minor)
+
+    _torch_version = importlib.metadata.version("torch")
+    if importlib.util.find_spec("intel_extension_for_pytorch") is None:
+        return False
+    _ipex_version = "N/A"
+    try:
+        _ipex_version = importlib.metadata.version("intel_extension_for_pytorch")
+    except importlib.metadata.PackageNotFoundError:
+        return False
+    torch_major_and_minor = get_major_and_minor_from_version(_torch_version)
+    ipex_major_and_minor = get_major_and_minor_from_version(_ipex_version)
+    if torch_major_and_minor != ipex_major_and_minor:
+        warnings.warn(
+            f"Intel Extension for PyTorch {ipex_major_and_minor} needs to work with PyTorch {ipex_major_and_minor}.*,"
+            f" but PyTorch {_torch_version} is found. Please switch to the matching version and run again."
+        )
+        return False
+    return True
+
+
+if torch.cuda.is_available():
+    torch.backends.cuda.matmul.allow_tf32 = True
+
+logger = logging.getLogger(__name__)
+
 IGNORE_INDEX = -100
-
+DEFAULT_PAD_TOKEN = "[PAD]"
 
 @dataclass
 class ModelArguments:
@@ -80,94 +125,93 @@ class DataArguments:
         metadata={"help": "Which dataset format is used. [alpaca|chip2|self-instruct|hh-rlhf]"}
     )
 
-# @dataclass
-# class TrainingArguments(transformers.Seq2SeqTrainingArguments):
-#     cache_dir: Optional[str] = field(
-#         default=None
-#     )
-#     train_on_source: Optional[bool] = field(
-#         default=False,
-#         metadata={"help": "Whether to train on the input in addition to the target text."}
-#     )
-#     mmlu_split: Optional[str] = field(
-#         default='eval',
-#         metadata={"help": "The MMLU split to run on"}
-#     )
-#     mmlu_dataset: Optional[str] = field(
-#         default='mmlu-fs',
-#         metadata={"help": "MMLU dataset to use: options are `mmlu-zs` for zero-shot or `mmlu-fs` for few shot."}
-#     )
-#     do_mmlu_eval: Optional[bool] = field(
-#         default=False,
-#         metadata={"help": "Whether to run the MMLU evaluation."}
-#     )
-#     max_mmlu_samples: Optional[int] = field(
-#         default=None,
-#         metadata={"help": "If set, only evaluates on `max_mmlu_samples` of the MMMLU dataset."}
-#     )
-#     mmlu_source_max_len: int = field(
-#         default=2048,
-#         metadata={"help": "Maximum source sequence length for mmlu."}
-#     )
-#     full_finetune: bool = field(
-#         default=False,
-#         metadata={"help": "Finetune the entire model without adapters."}
-#     )
-#     adam8bit: bool = field(
-#         default=False,
-#         metadata={"help": "Use 8-bit adam."}
-#     )
-#     double_quant: bool = field(
-#         default=True,
-#         metadata={"help": "Compress the quantization statistics through double quantization."}
-#     )
-#     quant_type: str = field(
-#         default="nf4",
-#         metadata={"help": "Quantization data type to use. Should be one of `fp4` or `nf4`."}
-#     )
-#     bits: int = field(
-#         default=4,
-#         metadata={"help": "How many bits to use."}
-#     )
-#     lora_r: int = field(
-#         default=64,
-#         metadata={"help": "Lora R dimension."}
-#     )
-#     lora_alpha: float = field(
-#         default=16,
-#         metadata={"help": " Lora alpha."}
-#     )
-#     lora_dropout: float = field(
-#         default=0.0,
-#         metadata={"help":"Lora dropout."}
-#     )
-#     max_memory_MB: int = field(
-#         default=80000,
-#         metadata={"help": "Free memory per gpu."}
-#     )
-#     report_to: str = field(
-#         default='none',
-#         metadata={"help": "To use wandb or something else for reporting."}
-#     )
-#     output_dir: str = field(default='./output', metadata={"help": 'The output dir for logs and checkpoints'})
-#     optim: str = field(default='paged_adamw_32bit', metadata={"help": 'The optimizer to be used'})
-#     per_device_train_batch_size: int = field(default=1, metadata={"help": 'The training batch size per GPU. Increase for better speed.'})
-#     gradient_accumulation_steps: int = field(default=16, metadata={"help": 'How many gradients to accumulate before to perform an optimizer step'})
-#     max_steps: int = field(default=10000, metadata={"help": 'How many optimizer update steps to take'})
-#     weight_decay: float = field(default=0.0, metadata={"help": 'The L2 weight decay rate of AdamW'}) # use lora dropout instead for regularization if needed
-#     learning_rate: float = field(default=0.0002, metadata={"help": 'The learnign rate'})
-#     remove_unused_columns: bool = field(default=False, metadata={"help": 'Removed unused columns. Needed to make this codebase work.'})
-#     max_grad_norm: float = field(default=0.3, metadata={"help": 'Gradient clipping max norm. This is tuned and works well for all models tested.'})
-#     gradient_checkpointing: bool = field(default=True, metadata={"help": 'Use gradient checkpointing. You want to use this.'})
-#     do_train: bool = field(default=True, metadata={"help": 'To train or not to train, that is the question?'})
-#     lr_scheduler_type: str = field(default='constant', metadata={"help": 'Learning rate schedule. Constant a bit better than cosine, and has advantage for analysis'})
-#     warmup_ratio: float = field(default=0.03, metadata={"help": 'Fraction of steps to do a warmup for'})
-#     logging_steps: int = field(default=10, metadata={"help": 'The frequency of update steps after which to log the loss'})
-#     group_by_length: bool = field(default=True, metadata={"help": 'Group sequences into batches with same length. Saves memory and speeds up training considerably.'})
-#     save_strategy: str = field(default='steps', metadata={"help": 'When to save checkpoints'})
-#     save_steps: int = field(default=250, metadata={"help": 'How often to save a model'})
-#     save_total_limit: int = field(default=40, metadata={"help": 'How many checkpoints to save before the oldest is overwritten'})
-
+@dataclass
+class TrainingArguments(transformers.Seq2SeqTrainingArguments):
+    cache_dir: Optional[str] = field(
+        default=None
+    )
+    train_on_source: Optional[bool] = field(
+        default=False,
+        metadata={"help": "Whether to train on the input in addition to the target text."}
+    )
+    mmlu_split: Optional[str] = field(
+        default='eval',
+        metadata={"help": "The MMLU split to run on"}
+    )
+    mmlu_dataset: Optional[str] = field(
+        default='mmlu-fs',
+        metadata={"help": "MMLU dataset to use: options are `mmlu-zs` for zero-shot or `mmlu-fs` for few shot."}
+    )
+    do_mmlu_eval: Optional[bool] = field(
+        default=False,
+        metadata={"help": "Whether to run the MMLU evaluation."}
+    )
+    max_mmlu_samples: Optional[int] = field(
+        default=None,
+        metadata={"help": "If set, only evaluates on `max_mmlu_samples` of the MMMLU dataset."}
+    )
+    mmlu_source_max_len: int = field(
+        default=2048,
+        metadata={"help": "Maximum source sequence length for mmlu."}
+    )
+    full_finetune: bool = field(
+        default=False,
+        metadata={"help": "Finetune the entire model without adapters."}
+    )
+    adam8bit: bool = field(
+        default=False,
+        metadata={"help": "Use 8-bit adam."}
+    )
+    double_quant: bool = field(
+        default=True,
+        metadata={"help": "Compress the quantization statistics through double quantization."}
+    )
+    quant_type: str = field(
+        default="nf4",
+        metadata={"help": "Quantization data type to use. Should be one of `fp4` or `nf4`."}
+    )
+    bits: int = field(
+        default=4,
+        metadata={"help": "How many bits to use."}
+    )
+    lora_r: int = field(
+        default=64,
+        metadata={"help": "Lora R dimension."}
+    )
+    lora_alpha: float = field(
+        default=16,
+        metadata={"help": " Lora alpha."}
+    )
+    lora_dropout: float = field(
+        default=0.0,
+        metadata={"help":"Lora dropout."}
+    )
+    max_memory_MB: int = field(
+        default=80000,
+        metadata={"help": "Free memory per gpu."}
+    )
+    report_to: str = field(
+        default='none',
+        metadata={"help": "To use wandb or something else for reporting."}
+    )
+    output_dir: str = field(default='./output', metadata={"help": 'The output dir for logs and checkpoints'})
+    optim: str = field(default='paged_adamw_32bit', metadata={"help": 'The optimizer to be used'})
+    per_device_train_batch_size: int = field(default=1, metadata={"help": 'The training batch size per GPU. Increase for better speed.'})
+    gradient_accumulation_steps: int = field(default=16, metadata={"help": 'How many gradients to accumulate before to perform an optimizer step'})
+    max_steps: int = field(default=10000, metadata={"help": 'How many optimizer update steps to take'})
+    weight_decay: float = field(default=0.0, metadata={"help": 'The L2 weight decay rate of AdamW'}) # use lora dropout instead for regularization if needed
+    learning_rate: float = field(default=0.0002, metadata={"help": 'The learnign rate'})
+    remove_unused_columns: bool = field(default=False, metadata={"help": 'Removed unused columns. Needed to make this codebase work.'})
+    max_grad_norm: float = field(default=0.3, metadata={"help": 'Gradient clipping max norm. This is tuned and works well for all models tested.'})
+    gradient_checkpointing: bool = field(default=True, metadata={"help": 'Use gradient checkpointing. You want to use this.'})
+    do_train: bool = field(default=True, metadata={"help": 'To train or not to train, that is the question?'})
+    lr_scheduler_type: str = field(default='constant', metadata={"help": 'Learning rate schedule. Constant a bit better than cosine, and has advantage for analysis'})
+    warmup_ratio: float = field(default=0.03, metadata={"help": 'Fraction of steps to do a warmup for'})
+    logging_steps: int = field(default=10, metadata={"help": 'The frequency of update steps after which to log the loss'})
+    group_by_length: bool = field(default=True, metadata={"help": 'Group sequences into batches with same length. Saves memory and speeds up training considerably.'})
+    save_strategy: str = field(default='steps', metadata={"help": 'When to save checkpoints'})
+    save_steps: int = field(default=250, metadata={"help": 'How often to save a model'})
+    save_total_limit: int = field(default=40, metadata={"help": 'How many checkpoints to save before the oldest is overwritten'})
 
 @dataclass
 class GenerationArguments:
@@ -201,6 +245,18 @@ class GenerationArguments:
     length_penalty: Optional[float] = field(default=1.0)
     no_repeat_ngram_size: Optional[int] = field(default=0)
 
+def find_all_linear_names(args, model):
+    cls = bnb.nn.Linear4bit if args.bits == 4 else (bnb.nn.Linear8bitLt if args.bits == 8 else torch.nn.Linear)
+    lora_module_names = set()
+    for name, module in model.named_modules():
+        if isinstance(module, cls):
+            names = name.split('.')
+            lora_module_names.add(names[0] if len(names) == 1 else names[-1])
+
+
+    if 'lm_head' in lora_module_names: # needed for 16-bit
+        lora_module_names.remove('lm_head')
+    return list(lora_module_names)
 
 
 class SavePeftModelCallback(transformers.TrainerCallback):
@@ -230,207 +286,123 @@ class SavePeftModelCallback(transformers.TrainerCallback):
         touch(join(args.output_dir, 'completed'))
         self.save_model(args, state, kwargs)
 
-
-def create_qlora_config(
-    quant_type: str = 'nf4',
-    compute_dtype: str = 'float16',
-    blocksize: int = 64,
-    double_quant: bool = True
-) -> Dict:
-    """
-    Create configuration for SuperSonicLinear4bit layer
-
-    Args:
-        quant_type: Quantization type - 'nf4' (recommended for QLoRA) or 'fp4'
-        compute_dtype: Computation dtype - 'float16', 'bfloat16', or 'float32'
-        blocksize: Block size for quantization (64, 128, 256, etc.)
-        double_quant: Whether to use double quantization for statistics compression
-
-    Returns:
-        Configuration dictionary for SuperSonicLinear4bit
-    """
-    if quant_type not in ['nf4', 'fp4']:
-        raise ValueError(f"quant_type must be 'nf4' or 'fp4', got {quant_type}")
-    if compute_dtype not in ['float16', 'bfloat16', 'float32']:
-        raise ValueError(f"compute_dtype must be 'float16', 'bfloat16', or 'float32', got {compute_dtype}")
-    valid_blocksizes = [64, 128, 256, 512, 1024, 2048, 4096]
-    if blocksize not in valid_blocksizes:
-        raise ValueError(f"blocksize must be one of {valid_blocksizes}, got {blocksize}")
-
-    return {
-        'quant_type': quant_type,
-        'compute_dtype': compute_dtype,
-        'blocksize': blocksize,
-        'double_quant': double_quant
-    }
-
-class SuperSonicLinear4bit(LoRALinear):
-    """
-    The core QLoRA layer - inherits LoRA capabilities + adds quantization
-
-    This combines 4-bit quantized weights with LoRA adapters for memory-efficient training.
-    Key features:
-    - 4-bit weight storage (NF4/FP4)
-    - BFloat16 compute for LoRA adapters
-    - Memory-efficient gradient computation
-    """
-
-    def __init__(self, in_features, out_features, config, lora_config):
-        super().__init__(in_features, out_features, **lora_config)
-
-        # Validate and set quantization parameters
-        self.quant_config = config
-        self.compute_dtype = config.get('compute_dtype', 'float16')
-        self.quant_type = config.get('quant_type', 'nf4')  # Default to NF4 as per QLoRA paper
-        self.blocksize = config.get('blocksize', 64)
-        self.double_quant = config.get('double_quant', True)  # Compress statistics
-
-        # Validate quantization type
-        if self.quant_type not in ['nf4', 'fp4']:
-            raise ValueError(f"Unsupported quant_type: {self.quant_type}. Must be 'nf4' or 'fp4'")
-
-        # Validate compute dtype
-        if self.compute_dtype not in ['float16', 'bfloat16', 'float32']:
-            raise ValueError(f"Unsupported compute_dtype: {self.compute_dtype}")
-
-        # Print configuration for debugging
-        print(f"SuperSonicLinear4bit initialized with:")
-        print(f"  - Quantization: {self.quant_type}")
-        print(f"  - Compute dtype: {self.compute_dtype}")
-        print(f"  - Block size: {self.blocksize}")
-        print(f"  - Double quantization: {self.double_quant}")
-
-        if hasattr(self, 'weight'):
-            self._quantize_weight()
-
-    def _quantize_weight(self):
-        """Quantize the base weight to 4-bit and store quantization state"""
-        from .quantization import quantize_4bit
-
-        # Quantize the weight tensor
-        quantized_weight, quant_state = quantize_4bit(
-            self.weight,
-            blocksize=self.blocksize,
-            quant_type=self.quant_type
-        )
-
-        self.quantized_weight = quantized_weight
-        self.quant_state = quant_state
-
-        # Remove original weight to save memory
-        self.weight.requires_grad = False
-        del self.weight
-
-    def _dequantize_weight(self):
-        """Dequantize weight for computation"""
-        from .quantization import dequantize_4bit
-
-        return dequantize_4bit(
-            self.quantized_weight,
-            self.quant_state
-        )
-
-    def forward(self, x):
-        """
-        Forward pass for QLoRA layer:
-        1. Dequantize base weights to compute dtype (BF16/FP16)
-        2. Compute base linear transformation
-        3. Compute LoRA adaptation (A @ B)
-        4. Combine base + LoRA results
-        """
-        # Convert input to compute dtype if needed
-        if self.compute_dtype == 'bfloat16':
-            x = x.cast('bfloat16')
-        elif self.compute_dtype == 'float16':
-            x = x.cast('float16')
-
-        # Base computation with dequantized weights
-        dequantized_weight = self._dequantize_weight()
-        if self.compute_dtype == 'bfloat16':
-            dequantized_weight = dequantized_weight.cast('bfloat16')
-        elif self.compute_dtype == 'float16':
-            dequantized_weight = dequantized_weight.cast('float16')
-
-        # Base linear transformation: x @ W.T
-        base_result = x @ dequantized_weight.T
-        if self.bias is not None:
-            base_result = base_result + self.bias
-
-        # LoRA computation (if r > 0 and not merged)
-        if self.r > 0 and not self.merged:
-            # Apply dropout to input
-            lora_input = self.lora_dropout(x)
-
-            # LoRA forward: input @ A.T @ B.T * scaling
-            lora_result = (
-                lora_input @ self.lora_A.T @ self.lora_B.T
-            ) * self.scaling
-
-            result = base_result + lora_result
-        else:
-            result = base_result
-
-        return result
-
 def get_accelerate_model(args, checkpoint_dir):
-    # TO-DO :function will  INIT MODEL ARCHITECTURE
-    #
-    # 1) Hardware:
-    #device = setup_tinygrad_devices(args)
-    #
-    # 2) model
-    #model = create_tinygrad_model(args.model_name_or_path)
 
-    # or Load pretrained weights from HuggingFace/PyTorch
-    if args.model_name_or_path.endswith('.safetensors'):
-        weights = safe_load(args.model_name_or_path)
-    else:
-        model_path = download_hf_model(args.model_name_or_path)
-        weights = torch_load(model_path)
+    if torch.cuda.is_available():
+        n_gpus = torch.cuda.device_count()
+    if is_ipex_available() and torch.xpu.is_available():
+        n_gpus = torch.xpu.device_count()
 
-    #TO-DO Handle HuggingFace -> tinygrad key mapping if needed TO_DO
-   # weights = convert_hf_to_tinygrad_keys(weights)
+    max_memory = f'{args.max_memory_MB}MB'
+    max_memory = {i: max_memory for i in range(n_gpus)}
+    device_map = "auto"
 
-    # Load weights into model
-    load_state_dict(model, weights, strict=False)
-
-    """
-
-    just some references on how some helpful functions that can implemnet this part
-
-    basically get_accelerate_model will
-    1.setup hardware/ detect GPUs/ config device mapping for multi-gpu or perhaps multi-training
-    2. model loading such as AutoModelForCausalLM.from_pretrained()
-    3. model configurations // configuring compute dtype based on hardware
-    4. tokenizer setup
-    5. qLoRA prep => prepare_model_for_kbit_training()
+    # if we are in a distributed setting, we need to set the device map and max memory per device
+    if os.environ.get('LOCAL_RANK') is not None:
+        local_rank = int(os.environ.get('LOCAL_RANK', '0'))
+        device_map = {'': local_rank}
+        max_memory = {'': max_memory[local_rank]}
 
 
+    if args.full_finetune: assert args.bits in [16, 32]
 
+    print(f'loading base model {args.model_name_or_path}...')
+    compute_dtype = (torch.float16 if args.fp16 else (torch.bfloat16 if args.bf16 else torch.float32))
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model_name_or_path,
+        cache_dir=args.cache_dir,
+        load_in_4bit=args.bits == 4,
+        load_in_8bit=args.bits == 8,
+        device_map=device_map,
+        max_memory=max_memory,
+        quantization_config=BitsAndBytesConfig(
+            load_in_4bit=args.bits == 4,
+            load_in_8bit=args.bits == 8,
+            llm_int8_threshold=6.0,
+            llm_int8_has_fp16_weight=False,
+            bnb_4bit_compute_dtype=compute_dtype,
+            bnb_4bit_use_double_quant=args.double_quant,
+            bnb_4bit_quant_type=args.quant_type,
+        ),
+        torch_dtype=(torch.float32 if args.fp16 else (torch.bfloat16 if args.bf16 else torch.float32)),
+        trust_remote_code=args.trust_remote_code,
+        use_auth_token=args.use_auth_token
+    )
+    if compute_dtype == torch.float16 and args.bits == 4:
+        if torch.cuda.is_bf16_supported():
+            print('='*80)
+            print('Your GPU supports bfloat16, you can accelerate training with the argument --bf16')
+            print('='*80)
 
-    from tinygrad.nn.state import torch_load, load_state_dict
+    if compute_dtype == torch.float16 and (is_ipex_available() and torch.xpu.is_available()):
+        compute_dtype = torch.bfloat16
+        print('Intel XPU does not support float16 yet, so switching to bfloat16')
 
-    # Load PyTorch weights directly
-    weights = torch_load("model.pth")  # or from HuggingFace hub
-    load_state_dict(model, weights)
-        ________________________________________________________
-    from tinygrad.nn.state import safe_load, load_state_dict
+    setattr(model, 'model_parallel', True)
+    setattr(model, 'is_parallelizable', True)
 
-    # Load safetensors (preferred format)
-    weights = safe_load("model.safetensors")
-    load_state_dict(model, weights)
+    model.config.torch_dtype=(torch.float32 if args.fp16 else (torch.bfloat16 if args.bf16 else torch.float32))
 
-    ________________________________________________________
+    # Tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.model_name_or_path,
+        cache_dir=args.cache_dir,
+        padding_side="right",
+        use_fast=False, # Fast tokenizer giving issues.
+        tokenizer_type='llama' if 'llama' in args.model_name_or_path else None, # Needed for HF name change
+        trust_remote_code=args.trust_remote_code,
+        use_auth_token=args.use_auth_token,
+    )
+    if tokenizer._pad_token is None:
+        smart_tokenizer_and_embedding_resize(
+            special_tokens_dict=dict(pad_token=DEFAULT_PAD_TOKEN),
+            tokenizer=tokenizer,
+            model=model,
+        )
+    if 'llama' in args.model_name_or_path or isinstance(tokenizer, LlamaTokenizer):
+        # LLaMA tokenizer may not have correct special tokens set.
+        # Check and add them if missing to prevent them from being parsed into different tokens.
+        # Note that these are present in the vocabulary.
+        # Note also that `model.config.pad_token_id` is 0 which corresponds to `<unk>` token.
+        print('Adding special tokens.')
+        tokenizer.add_special_tokens({
+                "eos_token": tokenizer.convert_ids_to_tokens(model.config.eos_token_id),
+                "bos_token": tokenizer.convert_ids_to_tokens(model.config.bos_token_id),
+                "unk_token": tokenizer.convert_ids_to_tokens(
+                    model.config.pad_token_id if model.config.pad_token_id != -1 else tokenizer.pad_token_id
+                ),
+        })
 
+    if not args.full_finetune:
+        model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=args.gradient_checkpointing)
 
-    weights = load("model.gguf")  # Handles GGUF automatically
-    load_state_dict(model, weights)
+    if not args.full_finetune:
+        if checkpoint_dir is not None:
+            print("Loading adapters from checkpoint.")
+            model = PeftModel.from_pretrained(model, join(checkpoint_dir, 'adapter_model'), is_trainable=True)
+        else:
+            print(f'adding LoRA modules...')
+            modules = find_all_linear_names(args, model)
+            config = LoraConfig(
+                r=args.lora_r,
+                lora_alpha=args.lora_alpha,
+                target_modules=modules,
+                lora_dropout=args.lora_dropout,
+                bias="none",
+                task_type="CAUSAL_LM",
+            )
+            model = get_peft_model(model, config)
 
-    """
-
-    # TO_DO Apply quantization and LoRA
-    #model = prepare_model_for_qlora(model, args)
-
+    for name, module in model.named_modules():
+        if isinstance(module, LoraLayer):
+            if args.bf16:
+                module = module.to(torch.bfloat16)
+        if 'norm' in name:
+            module = module.to(torch.float32)
+        if 'lm_head' in name or 'embed_tokens' in name:
+            if hasattr(module, 'weight'):
+                if args.bf16 and module.weight.dtype == torch.float32:
+                    module = module.to(torch.bfloat16)
     return model, tokenizer
 
 def print_trainable_parameters(args, model):
@@ -450,6 +422,27 @@ def print_trainable_parameters(args, model):
         f"trainable: {100 * trainable_params / all_param}"
     )
 
+def smart_tokenizer_and_embedding_resize(
+    special_tokens_dict: Dict,
+    tokenizer: transformers.PreTrainedTokenizer,
+    model: transformers.PreTrainedModel,
+):
+    """Resize tokenizer and embedding.
+
+    Note: This is the unoptimized version that may make your embedding size not be divisible by 64.
+    """
+    num_new_tokens = tokenizer.add_special_tokens(special_tokens_dict)
+    model.resize_token_embeddings(len(tokenizer))
+
+    if num_new_tokens > 0:
+        input_embeddings_data = model.get_input_embeddings().weight.data
+        output_embeddings_data = model.get_output_embeddings().weight.data
+
+        input_embeddings_avg = input_embeddings_data[:-num_new_tokens].mean(dim=0, keepdim=True)
+        output_embeddings_avg = output_embeddings_data[:-num_new_tokens].mean(dim=0, keepdim=True)
+
+        input_embeddings_data[-num_new_tokens:] = input_embeddings_avg
+        output_embeddings_data[-num_new_tokens:] = output_embeddings_avg
 
 @dataclass
 class DataCollatorForCausalLM(object):
@@ -484,15 +477,15 @@ class DataCollatorForCausalLM(object):
             tokenized_targets['input_ids']
         ):
             if not self.predict_with_generate:
-                input_ids.append(Tensor(tokenized_source + tokenized_target))
+                input_ids.append(torch.tensor(tokenized_source + tokenized_target))
                 if not self.train_on_source:
                     labels.append(
-                        Tensor([IGNORE_INDEX for _ in range(len(tokenized_source))] + copy.deepcopy(tokenized_target))
+                        torch.tensor([IGNORE_INDEX for _ in range(len(tokenized_source))] + copy.deepcopy(tokenized_target))
                     )
                 else:
-                    labels.append(Tensor(copy.deepcopy(tokenized_source + tokenized_target)))
+                    labels.append(torch.tensor(copy.deepcopy(tokenized_source + tokenized_target)))
             else:
-                input_ids.append(Tensor(tokenized_source))
+                input_ids.append(torch.tensor(tokenized_source))
         # Apply padding
         input_ids = pad_sequence(input_ids, batch_first=True, padding_value=self.tokenizer.pad_token_id)
         labels = pad_sequence(labels, batch_first=True, padding_value=IGNORE_INDEX) if not self.predict_with_generate else None
@@ -664,7 +657,6 @@ def make_data_module(tokenizer: transformers.PreTrainedTokenizer, args) -> Dict:
         if args.group_by_length:
             train_dataset = train_dataset.map(lambda x: {'length': len(x['input']) + len(x['output'])})
 
-    # To _DO REPLACE THIS WITH TINYGRAD TENSORS INSTEAD OF PYTORCH
     data_collator = DataCollatorForCausalLM(
         tokenizer=tokenizer,
         source_max_len=args.source_max_len,
@@ -693,7 +685,6 @@ def get_last_checkpoint(checkpoint_dir):
         return checkpoint_dir, is_completed # checkpoint found!
     return None, False # first training
 
-
 def train():
     hfparser = transformers.HfArgumentParser((
         ModelArguments, DataArguments, TrainingArguments, GenerationArguments
@@ -707,6 +698,10 @@ def train():
     print(args)
 
     checkpoint_dir, completed_training = get_last_checkpoint(args.output_dir)
+    if completed_training:
+        print('Detected that training was already completed!')
+
+    model, tokenizer = get_accelerate_model(args, checkpoint_dir)
 
     model.config.use_cache = False
     print('loaded model')
@@ -714,15 +709,12 @@ def train():
 
     data_module = make_data_module(tokenizer=tokenizer, args=args)
 
-    """
     trainer = Seq2SeqTrainer(
         model=model,
         tokenizer=tokenizer,
         args=training_args,
         **{k:v for k,v in data_module.items() if k != 'predict_dataset'},
     )
-
-    """
 
     # Callbacks
     if not args.full_finetune:
