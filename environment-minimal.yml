@@ -1,0 +1,33 @@
+name: supersonic-minimal
+channels:
+  - pytorch
+  - conda-forge
+  - defaults
+
+dependencies:
+  # Base Python
+  - python=3.10
+
+  # Core ML frameworks
+  - pytorch>=2.0.0
+  - numpy>=1.24.0
+
+  # Data processing
+  - pandas>=2.0.0
+
+  # Essential utilities
+  - tqdm
+  - packaging
+
+  # pip dependencies
+  - pip
+  - pip:
+    # Core tinygrad framework
+    - tinygrad>=0.9.0
+    
+    # HuggingFace essentials
+    - transformers>=4.35.0
+    - datasets>=2.14.0
+    
+    # Optional but recommended for quantization
+    - bitsandbytes>=0.41.0

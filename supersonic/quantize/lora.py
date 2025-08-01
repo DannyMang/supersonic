@@ -1,11 +1,9 @@
-from tinygrad import dtype
-from tinygrad.device import device
-from tinygrad.tensor  import Tensor
-from tinygrad.engine.jit import TinyJit
+from tinygrad.tensor import Tensor
+from tinygrad.dtype import dtypes
 import tinygrad.nn as nn
 import math
 from typing import cast, Optional, List
-from utils import dropout
+from ..utils import dropout
 
 """
 sources:

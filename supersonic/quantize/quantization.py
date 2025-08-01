@@ -2,9 +2,9 @@ from __future__ import annotations
 from tinygrad.tensor import Tensor
 from tinygrad.dtype import dtypes
 from tinygrad.device import Device
-from utils import unpack_tensor_to_dict, quantize_to_indices, pack_dict_to_tensor, pack_4bit_pairs, unpack_4bit_pairs
-from config.quantization import SuperSonicConfig
-from tinygrad.uop.mathtraits import MathTrait
+from ..utils import unpack_tensor_to_dict, quantize_to_indices, pack_dict_to_tensor, pack_4bit_pairs, unpack_4bit_pairs
+from ..config.quantization import SuperSonicConfig
+# from tinygrad.uop.mathtraits import MathTrait
 from typing import Any, Optional, Union, cast
 
 """

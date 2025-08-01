@@ -1,0 +1,55 @@
+# Core ML Framework
+tinygrad>=0.9.0
+
+# Quantization and Training
+torch>=2.0.0
+transformers>=4.35.0
+datasets>=2.14.0
+accelerate>=0.21.0
+
+# LoRA and Parameter-Efficient Fine-tuning
+peft>=0.5.0
+
+# Quantization Libraries (optional but recommended)
+bitsandbytes>=0.41.0
+triton>=2.0.0
+
+# Data Processing
+numpy>=1.24.0
+pandas>=2.0.0
+
+# Training and Evaluation
+evaluate>=0.4.0
+scikit-learn>=1.3.0
+tqdm>=4.65.0
+
+# Configuration and Serialization
+pydantic>=2.0.0
+packaging>=23.0
+dataclasses-json>=0.6.0
+
+# Logging and Monitoring
+wandb>=0.15.0
+tensorboard>=2.14.0
+
+# Development and Testing
+pytest>=7.4.0
+black>=23.0.0
+isort>=5.12.0
+flake8>=6.0.0
+
+# Optional: For specific model architectures
+sentencepiece>=0.1.99
+tokenizers>=0.15.0
+
+# Optional: For advanced optimizations
+flash-attn>=2.0.0; sys_platform != "darwin"  # Not available on macOS
+apex; sys_platform == "linux"  # NVIDIA Apex for mixed precision
+
+# System utilities
+psutil>=5.9.0
+gpustat>=1.1.0
+
+# Jupyter support (optional)
+jupyter>=1.0.0
+ipywidgets>=8.0.0

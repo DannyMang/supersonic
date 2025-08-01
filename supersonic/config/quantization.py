@@ -27,17 +27,30 @@ from typing import Any, Optional, Union
 from tinygrad.dtype import DType, dtypes
 from packaging import version
 
-from ..utils import (
-    is_auto_awq_available,
-    is_compressed_tensors_available,
-    is_gptqmodel_available,
-    is_hqq_available,
-    is_quark_available,
-    is_torch_available,
-    is_torchao_available,
-    logging,
-)
-from .import_utils import is_auto_gptq_available
+try:
+    import torch
+    is_torch_available = lambda: True
+except ImportError:
+    is_torch_available = lambda: False
+
+is_auto_awq_available = lambda: False
+is_compressed_tensors_available = lambda: False
+is_gptqmodel_available = lambda: False
+is_hqq_available = lambda: False
+is_quark_available = lambda: False
+is_torchao_available = lambda: False
+is_auto_gptq_available = lambda: False
+
+# Basic logging
+class Logger:
+    def get_logger(self, name):
+        class DummyLogger:
+            def info(self, msg): print(f"INFO: {msg}")
+            def warning(self, msg): print(f"WARNING: {msg}")
+            def error(self, msg): print(f"ERROR: {msg}")
+        return DummyLogger()
+
+logging = Logger()
 
 
 

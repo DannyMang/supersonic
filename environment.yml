@@ -1,0 +1,64 @@
+name: supersonic
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+
+dependencies:
+  # Base Python
+  - python=3.10
+
+  # Core ML frameworks
+  - pytorch>=2.0.0
+  - numpy>=1.24.0
+  - scipy>=1.10.0
+
+  # Data processing
+  - pandas>=2.0.0
+  - scikit-learn>=1.3.0
+
+  # Development tools
+  - jupyter
+  - ipywidgets
+  - tqdm
+  - packaging
+
+  # System utilities
+  - psutil
+
+  # pip dependencies (not available via conda)
+  - pip
+  - pip:
+    # Core tinygrad framework
+    - tinygrad>=0.9.0
+    
+    # HuggingFace ecosystem
+    - transformers>=4.35.0
+    - datasets>=2.14.0
+    - accelerate>=0.21.0
+    - tokenizers>=0.15.0
+    - evaluate>=0.4.0
+    
+    # Parameter-efficient fine-tuning
+    - peft>=0.5.0
+    
+    # Quantization (optional but recommended)
+    - bitsandbytes>=0.41.0
+    
+    # Configuration and serialization
+    - pydantic>=2.0.0
+    - dataclasses-json>=0.6.0
+    
+    # Logging and monitoring (optional)
+    - wandb>=0.15.0
+    - tensorboard>=2.14.0
+    
+    # Model-specific dependencies
+    - sentencepiece>=0.1.99
+    
+    # Development tools
+    - pytest>=7.4.0
+    - black>=23.0.0
+    - isort>=5.12.0
+    - flake8>=6.0.0

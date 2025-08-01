@@ -25,7 +25,7 @@ from .lora import Linear as LoRALinear
 from .quantization import quantize_4bit, dequantize_4bit, QuantState
 import transformers
 from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
-
+from .supersonicTrainer import SuperSonicTrainer, TrainingArguments
 from tinygrad.nn.state import torch_load, safe_load, load_state_dict
 
 # Constants
@@ -636,11 +636,6 @@ def train():
     )
 
     """
-
-
-    # Initialize SuperSonicTrainer instead of Seq2SeqTrainer
-    from .supersonicTrainer import SuperSonicTrainer, TrainingArguments
-
      # Create training arguments for SuperSonicTrainer with ALL original fields
     training_args = TrainingArguments(
         # Core training

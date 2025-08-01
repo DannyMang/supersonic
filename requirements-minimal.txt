@@ -1,0 +1,22 @@
+# Minimal requirements for supersonic QLoRA functionality
+
+# Core ML Framework
+tinygrad>=0.9.0
+
+# Essential ML Libraries
+torch>=2.0.0
+transformers>=4.35.0
+datasets>=2.14.0
+
+# Data Processing
+numpy>=1.24.0
+pandas>=2.0.0
+
+# Training utilities
+tqdm>=4.65.0
+
+# Configuration
+packaging>=23.0
+
+# Optional but highly recommended for quantization
+bitsandbytes>=0.41.0

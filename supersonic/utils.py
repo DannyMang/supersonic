@@ -91,14 +91,15 @@ def pack_4bit_pairs(indices: Tensor) -> Tensor:
     # 80 | 10  = 0101 0000 | 0000 1010 = 0101 1010 = 90
     # 48 | 15  = 0011 0000 | 0000 1111 = 0011 1111 = 63
     # 112 | 0  = 0111 0000 | 0000 0000 = 0111 0000 = 112
-    packed = Tensor((pairs[:, 0] << 4) | pairs[:, 1])
+    packed = ((pairs[:, 0] << 4) | pairs[:, 1]).cast(dtypes.uint8)
 
     #Final result: [90, 63, 112] (3 bytes storing 6 values)
-    return packed.cast(dtypes.uint8)
+    return packed
 
 def unpack_4bit_pairs(packed: Tensor, target_length: int) -> Tensor:
     """Unpack uint8 storage back to 4-bit indices"""
-    high_nibble = Tensor((packed >> 4) & 0xF)
-    low_nibble = Tensor(packed & 0xF)
-    unpacked = high_nibble.stack(low_nibble, dim=1).flatten()
+    high_nibble = ((packed >> 4) & 0xF).cast(dtypes.uint8)
+    low_nibble = (packed & 0xF).cast(dtypes.uint8)
+    # Interleave high and low nibbles
+    unpacked = high_nibble.unsqueeze(1).cat(low_nibble.unsqueeze(1), dim=1).flatten()
     return unpacked[:target_length]
