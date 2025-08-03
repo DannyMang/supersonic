@@ -516,5 +516,10 @@ class Int8Params(torch.nn.Parameter):
         return new_param
 """
 def replace_linear_with_supersonic(model, config):
-    """Replace nn.Linear layers with SuperSonicLinear4bit"""
-    pass
+    """Replace nn.Linear layers with SuperSonicLinear4bit
+    
+    This is implemented in model_utils.py to avoid circular imports.
+    This stub is kept for backwards compatibility.
+    """
+    from .model_utils import prepare_model_for_supersonic_training
+    return prepare_model_for_supersonic_training(model, config)
