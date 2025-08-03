@@ -27,6 +27,8 @@ import transformers
 from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
 from .supersonicTrainer import SuperSonicTrainer, TrainingArguments
 from tinygrad.nn.state import torch_load, safe_load, load_state_dict
+import torch  # For type annotations and pad_sequence
+from torch.nn.utils.rnn import pad_sequence
 
 # Constants
 IGNORE_INDEX = -100

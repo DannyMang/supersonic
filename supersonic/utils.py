@@ -103,3 +103,17 @@ def unpack_4bit_pairs(packed: Tensor, target_length: int) -> Tensor:
     # Interleave high and low nibbles
     unpacked = high_nibble.unsqueeze(1).cat(low_nibble.unsqueeze(1), dim=1).flatten()
     return unpacked[:target_length]
+
+
+#MODEL UTILS
+def prepare_model_for_supersonic_training(model, config):
+    """Prepare model for QLoRA training"""
+    pass
+
+def load_quantized_model(model_name_or_path, config):
+    """Load model with SuperSonic quantization"""
+    pass
+
+def estimate_memory_usage(model, config):
+    """Estimate memory requirements"""
+    pass
