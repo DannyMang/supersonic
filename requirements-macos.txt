@@ -1,0 +1,53 @@
+# Minimal requirements for supersonic QLoRA functionality on macOS
+# Optimized for Apple Silicon (M1/M2/M3) and Intel Macs
+
+# Core ML Framework
+tinygrad>=0.9.0
+
+# Essential ML Libraries
+torch>=2.0.0
+transformers>=4.35.0
+datasets>=2.14.0
+accelerate>=0.21.0
+
+# LoRA and Parameter-Efficient Fine-tuning
+peft>=0.5.0
+
+# Data Processing
+numpy>=1.24.0
+pandas>=2.0.0
+
+# Training and Evaluation
+evaluate>=0.4.0
+scikit-learn>=1.3.0
+tqdm>=4.65.0
+
+# Configuration and Serialization
+pydantic>=2.0.0
+packaging>=23.0
+
+# Tokenization
+sentencepiece>=0.1.99
+tokenizers>=0.15.0
+
+# System utilities
+psutil>=5.9.0
+
+# Optional but recommended for quantization (may have limited functionality on macOS)
+bitsandbytes>=0.41.0
+
+# Development and Testing
+pytest>=7.4.0
+
+# Optional: Logging and Monitoring
+# wandb>=0.15.0  # Uncomment if you want experiment tracking
+# tensorboard>=2.14.0  # Uncomment if you want TensorBoard
+
+# Note: The following packages are NOT available on macOS:
+# - triton>=2.0.0 (Linux/Windows only)
+# - flash-attn>=2.0.0 (not available on macOS)
+# - apex (NVIDIA specific, Linux only)
+
+# For Apple Silicon optimization, consider:
+# - Using Metal Performance Shaders via PyTorch MPS backend
+# - torch.backends.mps.is_available() for GPU acceleration
