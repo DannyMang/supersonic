@@ -3,6 +3,7 @@ Inspired by Daniel Han's Unsloth.ai
 - Quantize models
 - be able to run the largest models while being GPU Poor.
 
+
 GOAL : Democratize ai for all
 
 ROADMAP:
